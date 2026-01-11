@@ -1,0 +1,475 @@
+//
+//  SettingsView.swift
+//  DesktopTitle
+//
+//  Settings window UI
+//
+
+import SwiftUI
+
+struct SettingsView: View {
+    @ObservedObject private var settings = AppSettings.shared
+    @ObservedObject private var spaceConfigManager = SpaceConfigManager.shared
+    @ObservedObject private var imageCache = DesktopImageCache.shared
+    @State private var spaces: [SpaceInfo] = []
+    @State private var spaceNames: [UInt64: String] = [:]
+    @State private var spaceBackgroundColors: [UInt64: Color] = [:]
+    @State private var spaceTextColors: [UInt64: Color] = [:]
+    @FocusState private var focusedSpaceIndex: Int?
+
+    var body: some View {
+        TabView {
+            spacesTab
+                .tabItem {
+                    Label("Desktops", systemImage: "rectangle.split.3x1")
+                }
+
+            displayTab
+                .tabItem {
+                    Label("Display", systemImage: "textformat.size")
+                }
+
+            generalTab
+                .tabItem {
+                    Label("General", systemImage: "gear")
+                }
+        }
+        .padding()
+        .frame(minWidth: 400, minHeight: 350)
+        .onAppear {
+            refreshSpaces()
+        }
+    }
+
+    // MARK: - Spaces Tab
+
+    private var spacesTab: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Desktop Names")
+                    .font(.headline)
+
+                Spacer()
+
+                Toggle("Show Desktop Images", isOn: $settings.showDesktopImages)
+                    .toggleStyle(.switch)
+            }
+
+            // Permission warning
+            if settings.showDesktopImages && !imageCache.hasPermission {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("Screen recording permission required")
+                            .font(.caption)
+                        Spacer()
+                        Button("Re-check") {
+                            imageCache.checkPermission()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        Button("Open Settings") {
+                            imageCache.requestPermission()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    Text("Add this app to Screen Recording:")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(DesktopImageCache.appPath)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(.orange.opacity(0.1)))
+            }
+
+            if spaces.isEmpty {
+                Text("No desktops detected")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding()
+            } else {
+                List {
+                    ForEach(Array(spaces.enumerated()), id: \.element.id) { index, space in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                // Highlight current desktop
+                                let isCurrent = space.id == SpaceMonitor.shared.currentSpace?.id
+
+                                Text("Desktop \(space.index)")
+                                    .frame(width: 100, alignment: .leading)
+                                    .foregroundStyle(isCurrent ? .blue : .secondary)
+
+                                TextField("Enter name...", text: binding(for: space))
+                                    .textFieldStyle(.roundedBorder)
+                                    .focused($focusedSpaceIndex, equals: index)
+
+                                if isCurrent {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.blue)
+                                        .help("Current desktop")
+                                }
+                            }
+
+                            // Per-desktop color settings (only show when not using unified colors)
+                            if !settings.useUnifiedColors {
+                                HStack(spacing: 16) {
+                                    HStack(spacing: 6) {
+                                        Text("Background")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        ColorPicker("Background", selection: backgroundColorBinding(for: space))
+                                            .labelsHidden()
+                                            .help("Background color for this desktop")
+                                    }
+
+                                    HStack(spacing: 6) {
+                                        Text("Text")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        ColorPicker("Text", selection: textColorBinding(for: space))
+                                            .labelsHidden()
+                                            .help("Text color for this desktop")
+                                    }
+
+                                    Spacer()
+                                }
+                                .padding(.leading, 100)
+                            }
+
+                            // Desktop thumbnail (only show if permission granted)
+                            if settings.showDesktopImages && imageCache.hasPermission {
+                                if let image = imageCache.getImage(for: space.id) {
+                                    Image(nsImage: image)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(height: 80)
+                                        .cornerRadius(6)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .stroke(.gray.opacity(0.3), lineWidth: 1)
+                                        )
+                                } else {
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .fill(.gray.opacity(0.2))
+                                        .frame(height: 80)
+                                        .overlay {
+                                            VStack(spacing: 4) {
+                                                Text("No image yet")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                Text("Switch to this desktop to capture")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.tertiary)
+                                            }
+                                        }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+                .listStyle(.bordered(alternatesRowBackgrounds: true))
+            }
+
+            HStack {
+                Button("Refresh") {
+                    refreshSpaces()
+                }
+
+                Spacer()
+
+                Button("Clear All Names") {
+                    clearAllNames()
+                }
+            }
+        }
+        .padding()
+        .onChange(of: settings.showDesktopImages) { isEnabled in
+            guard isEnabled else { return }
+            imageCache.checkPermission()
+            if imageCache.hasPermission {
+                imageCache.captureNow()
+            }
+        }
+        .onChange(of: imageCache.hasPermission) { hasPermission in
+            guard settings.showDesktopImages, hasPermission else { return }
+            imageCache.captureNow()
+        }
+    }
+
+    // MARK: - Display Tab
+
+    private var displayTab: some View {
+        ScrollView {
+            Form {
+                Section {
+                    HStack {
+                        Text("Display Delay")
+                        Spacer()
+                        Slider(value: $settings.displayDelay, in: 0...1, step: 0.1) {
+                            Text("Delay")
+                        }
+                        .frame(width: 150)
+                        Text("\(settings.displayDelay, specifier: "%.1f") sec")
+                            .frame(width: 60)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Text("Display Duration")
+                        Spacer()
+                        Slider(value: $settings.displayDuration, in: 0.5...5, step: 0.5) {
+                            Text("Duration")
+                        }
+                        .frame(width: 150)
+                        Text("\(settings.displayDuration, specifier: "%.1f") sec")
+                            .frame(width: 60)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Toggle("Show desktop number", isOn: $settings.showSpaceIndex)
+                } header: {
+                    Text("Timing")
+                }
+
+                Section {
+                    HStack {
+                        Text("Position X")
+                        Spacer()
+                        Slider(value: $settings.positionX, in: 0...1, step: 0.1) {
+                            Text("X")
+                        }
+                        .frame(width: 150)
+                        Text(positionLabel(settings.positionX, axis: "X"))
+                            .frame(width: 60)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Text("Position Y")
+                        Spacer()
+                        Slider(value: $settings.positionY, in: 0...1, step: 0.1) {
+                            Text("Y")
+                        }
+                        .frame(width: 150)
+                        Text(positionLabel(settings.positionY, axis: "Y"))
+                            .frame(width: 60)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Position")
+                }
+
+                Section {
+                    Picker("Font", selection: $settings.fontName) {
+                        Text("System Default").tag("")
+                        ForEach(AppSettings.availableFonts.filter { !$0.isEmpty }, id: \.self) { font in
+                            Text(font).tag(font)
+                        }
+                    }
+
+                    HStack {
+                        Text("Font Size")
+                        Spacer()
+                        Slider(value: $settings.fontSize, in: 24...96, step: 4) {
+                            Text("Font Size")
+                        }
+                        .frame(width: 150)
+                        Text("\(Int(settings.fontSize)) pt")
+                            .frame(width: 60)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Font")
+                }
+
+                Section {
+                    Toggle("Use unified colors for all desktops", isOn: $settings.useUnifiedColors)
+
+                    if settings.useUnifiedColors {
+                        ColorPicker("Text Color", selection: $settings.textColor)
+                        ColorPicker("Background Color", selection: $settings.backgroundColor)
+                    } else {
+                        Text("Per-desktop colors can be set in the Desktops tab")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Colors")
+                }
+
+                Section {
+                    // Preview
+                    previewView
+                        .frame(height: 150)
+                } header: {
+                    Text("Preview")
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .padding()
+    }
+
+    private func positionLabel(_ value: Double, axis: String) -> String {
+        if value < 0.3 {
+            return axis == "X" ? "Left" : "Top"
+        } else if value > 0.7 {
+            return axis == "X" ? "Right" : "Bottom"
+        } else {
+            return "Center"
+        }
+    }
+
+    private var previewView: some View {
+        GeometryReader { geometry in
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(.gray.opacity(0.3))
+
+                VStack(spacing: 4) {
+                    Text("Desktop Name")
+                        .font(previewFont(size: settings.fontSize * 0.4))
+                        .foregroundStyle(settings.textColor)
+
+                    if settings.showSpaceIndex {
+                        Text("Desktop 1")
+                            .font(previewFont(size: settings.fontSize * 0.2))
+                            .foregroundStyle(settings.textColor.opacity(0.7))
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+                .background {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(settings.backgroundColor)
+                }
+                .position(
+                    x: geometry.size.width * settings.positionX,
+                    y: geometry.size.height * settings.positionY
+                )
+            }
+        }
+    }
+
+    private func previewFont(size: CGFloat) -> Font {
+        if settings.fontName.isEmpty {
+            return .system(size: size, weight: .medium, design: .rounded)
+        } else {
+            return .custom(settings.fontName, size: size)
+        }
+    }
+
+    // MARK: - General Tab
+
+    private var generalTab: some View {
+        Form {
+            Section {
+                Toggle("Launch at login", isOn: $settings.launchAtLogin)
+                Toggle("Show for fullscreen apps", isOn: $settings.showForFullscreen)
+            } header: {
+                Text("Behavior")
+            }
+
+            Section {
+                Button("Reset to Defaults") {
+                    settings.resetToDefaults()
+                }
+            } header: {
+                Text("Reset")
+            }
+
+            Section {
+                HStack {
+                    Text("Version")
+                    Spacer()
+                    Text("1.0.0")
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("About")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+
+    // MARK: - Helper Methods
+
+    private func binding(for space: SpaceInfo) -> Binding<String> {
+        Binding(
+            get: {
+                spaceNames[space.id] ?? spaceConfigManager.getConfig(for: space).name
+            },
+            set: { newValue in
+                spaceNames[space.id] = newValue
+                spaceConfigManager.setName(newValue, for: space.id, displayIndex: space.index)
+            }
+        )
+    }
+
+    private func backgroundColorBinding(for space: SpaceInfo) -> Binding<Color> {
+        Binding(
+            get: {
+                spaceBackgroundColors[space.id] ?? spaceConfigManager.getBackgroundColor(for: space) ?? settings.backgroundColor
+            },
+            set: { newValue in
+                spaceBackgroundColors[space.id] = newValue
+                let textColor = spaceTextColors[space.id] ?? spaceConfigManager.getTextColor(for: space)
+                spaceConfigManager.setColors(backgroundColor: newValue, textColor: textColor, for: space.id, displayIndex: space.index)
+            }
+        )
+    }
+
+    private func textColorBinding(for space: SpaceInfo) -> Binding<Color> {
+        Binding(
+            get: {
+                spaceTextColors[space.id] ?? spaceConfigManager.getTextColor(for: space) ?? settings.textColor
+            },
+            set: { newValue in
+                spaceTextColors[space.id] = newValue
+                let bgColor = spaceBackgroundColors[space.id] ?? spaceConfigManager.getBackgroundColor(for: space)
+                spaceConfigManager.setColors(backgroundColor: bgColor, textColor: newValue, for: space.id, displayIndex: space.index)
+            }
+        )
+    }
+
+    private func refreshSpaces() {
+        spaces = SpaceIdentifier.shared.getAllSpaces().filter { !$0.isFullscreen }
+        spaceConfigManager.syncWithCurrentSpaces()
+
+        // Load current names and colors
+        for space in spaces {
+            let config = spaceConfigManager.getConfig(for: space)
+            spaceNames[space.id] = config.name
+            if let bgColor = config.backgroundColor?.color {
+                spaceBackgroundColors[space.id] = bgColor
+            }
+            if let txtColor = config.textColor?.color {
+                spaceTextColors[space.id] = txtColor
+            }
+        }
+    }
+
+    private func clearAllNames() {
+        for space in spaces {
+            spaceNames[space.id] = ""
+            spaceBackgroundColors[space.id] = nil
+            spaceTextColors[space.id] = nil
+            spaceConfigManager.setName("", for: space.id, displayIndex: space.index)
+            spaceConfigManager.setColors(backgroundColor: nil, textColor: nil, for: space.id, displayIndex: space.index)
+        }
+        // Also clear cached images
+        imageCache.clearAllImages()
+    }
+}
+
+#Preview {
+    SettingsView()
+        .frame(width: 480, height: 500)
+}

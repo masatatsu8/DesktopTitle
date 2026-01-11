@@ -1,0 +1,96 @@
+//
+//  MenuBarController.swift
+//  DesktopTitle
+//
+//  Manages the menu bar status item
+//
+
+import AppKit
+import SwiftUI
+
+/// Controls the menu bar icon and menu
+final class MenuBarController {
+
+    private var statusItem: NSStatusItem?
+    private var settingsWindow: NSWindow?
+
+    init() {
+        setupStatusItem()
+    }
+
+    private func setupStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+        if let button = statusItem?.button {
+            button.image = NSImage(systemSymbolName: "rectangle.split.3x1", accessibilityDescription: "DesktopTitle")
+            button.image?.isTemplate = true
+        }
+
+        setupMenu()
+    }
+
+    private func setupMenu() {
+        let menu = NSMenu()
+
+        // Current space info
+        let currentSpaceItem = NSMenuItem(title: "Current: Desktop 1", action: nil, keyEquivalent: "")
+        currentSpaceItem.isEnabled = false
+        currentSpaceItem.tag = 100  // Tag for updating
+        menu.addItem(currentSpaceItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Settings
+        let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Quit
+        let quitItem = NSMenuItem(title: "Quit DesktopTitle", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem?.menu = menu
+    }
+
+    /// Update the current space display in the menu
+    func updateCurrentSpace(_ spaceInfo: SpaceInfo?) {
+        guard let menu = statusItem?.menu,
+              let currentItem = menu.item(withTag: 100) else {
+            return
+        }
+
+        if let space = spaceInfo {
+            let name = SpaceConfigManager.shared.getDisplayName(for: space)
+            currentItem.title = "Current: \(name)"
+        } else {
+            currentItem.title = "Current: Unknown"
+        }
+    }
+
+    @objc private func openSettings() {
+        if settingsWindow == nil {
+            let settingsView = SettingsView()
+            let hostingController = NSHostingController(rootView: settingsView)
+
+            let window = NSWindow(contentViewController: hostingController)
+            window.title = "DesktopTitle Settings"
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.setContentSize(NSSize(width: 480, height: 500))
+            window.minSize = NSSize(width: 400, height: 350)
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            window.center()
+
+            settingsWindow = window
+        }
+
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
+    }
+}
