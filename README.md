@@ -10,14 +10,12 @@ macOS menu bar app that displays desktop (Space) names when switching between de
   - Text and background colors (unified or per-desktop)
   - Display position (X/Y)
   - Display duration and delay
-- Desktop thumbnail previews in settings (requires screen recording permission)
 - Works across all Spaces including fullscreen apps
 - Lightweight menu bar app
 
 ## Requirements
 
 - macOS 15.0 (Sequoia) or later
-- Screen recording permission (optional, for desktop thumbnails)
 
 ## Building
 
@@ -63,8 +61,7 @@ DesktopTitle/
 ├── Core/
 │   ├── CGSPrivate.h             # Private API declarations
 │   ├── SpaceIdentifier.swift    # Space detection
-│   ├── SpaceMonitor.swift       # Space change monitoring
-│   └── DesktopImageCache.swift  # Desktop screenshot caching
+│   └── SpaceMonitor.swift       # Space change monitoring
 ├── Models/
 │   ├── SpaceConfig.swift        # Per-desktop configuration
 │   └── AppSettings.swift        # Global app settings

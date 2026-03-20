@@ -8,6 +8,10 @@
 import Foundation
 import SwiftUI
 
+private struct SpaceConfigStore: Codable {
+    var profiles: [String: [UInt64: SpaceConfig]]
+}
+
 /// Codable wrapper for Color
 struct CodableColor: Codable, Equatable {
     var red: Double
@@ -61,9 +65,20 @@ final class SpaceConfigManager: ObservableObject {
     @Published private(set) var configs: [UInt64: SpaceConfig] = [:]
 
     private let userDefaultsKey = "SpaceConfigs"
+    private var configsByProfile: [String: [UInt64: SpaceConfig]] = [:]
+    private var activeProfileID: String = DisplayConfiguration.current().id
 
     private init() {
         loadConfigs()
+        configs = configsByProfile[activeProfileID] ?? [:]
+    }
+
+    func setActiveProfile(_ profileID: String) {
+        guard profileID != activeProfileID else { return }
+        configsByProfile[activeProfileID] = configs
+        activeProfileID = profileID
+        configs = configsByProfile[profileID] ?? [:]
+        saveConfigs()
     }
 
     /// Get or create config for a space
@@ -141,15 +156,23 @@ final class SpaceConfigManager: ObservableObject {
     // MARK: - Persistence
 
     private func loadConfigs() {
-        guard let data = UserDefaults.standard.data(forKey: userDefaultsKey),
-              let decoded = try? JSONDecoder().decode([UInt64: SpaceConfig].self, from: data) else {
+        guard let data = UserDefaults.standard.data(forKey: userDefaultsKey) else {
             return
         }
-        configs = decoded
+
+        if let decoded = try? JSONDecoder().decode(SpaceConfigStore.self, from: data) {
+            configsByProfile = decoded.profiles
+            return
+        }
+
+        if let legacyConfigs = try? JSONDecoder().decode([UInt64: SpaceConfig].self, from: data) {
+            configsByProfile[activeProfileID] = legacyConfigs
+        }
     }
 
     private func saveConfigs() {
-        guard let data = try? JSONEncoder().encode(configs) else {
+        configsByProfile[activeProfileID] = configs
+        guard let data = try? JSONEncoder().encode(SpaceConfigStore(profiles: configsByProfile)) else {
             return
         }
         UserDefaults.standard.set(data, forKey: userDefaultsKey)

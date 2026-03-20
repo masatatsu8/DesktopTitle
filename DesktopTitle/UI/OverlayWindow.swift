@@ -8,21 +8,6 @@
 import AppKit
 import SwiftUI
 
-// MARK: - NSScreen Extension
-
-extension NSScreen {
-    /// Get the display UUID string for matching with CGSPrivate display identifiers
-    var displayUUIDString: String? {
-        guard let screenNumber = deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
-            return nil
-        }
-        guard let uuid = CGDisplayCreateUUIDFromDisplayID(screenNumber)?.takeRetainedValue() else {
-            return nil
-        }
-        return CFUUIDCreateString(nil, uuid) as String?
-    }
-}
-
 /// A borderless, transparent window that displays above all other windows
 final class OverlayWindow: NSWindow {
 
@@ -46,16 +31,26 @@ final class OverlayWindow: NSWindow {
         backgroundColor = .clear
         hasShadow = false
 
-        // Display above everything including fullscreen apps
+        // Display above normal app windows and fullscreen content.
         level = .screenSaver
-        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
 
         // Ignore mouse events (click-through)
         ignoresMouseEvents = true
 
         // Don't show in Mission Control or other system UIs
         isExcludedFromWindowsMenu = true
+
+        // Prevent this window from ever becoming key or main
+        // This is critical to prevent focus stealing
+        isReleasedWhenClosed = false
     }
+
+    // Prevent overlay from becoming key window (stealing focus)
+    override var canBecomeKey: Bool { false }
+
+    // Prevent overlay from becoming main window
+    override var canBecomeMain: Bool { false }
 
     /// Update window frame to match the provided screen (or main screen)
     func updateFrame(for screen: NSScreen?) {
@@ -65,6 +60,14 @@ final class OverlayWindow: NSWindow {
 
     /// Display the overlay with the given content
     func show<Content: View>(content: Content, on screen: NSScreen? = nil) {
+        // Ensure we're on main thread
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.show(content: content, on: screen)
+            }
+            return
+        }
+
         let hostingView = NSHostingView(rootView: content)
         hostingView.frame = contentView?.bounds ?? .zero
         hostingView.autoresizingMask = [.width, .height]
@@ -73,11 +76,19 @@ final class OverlayWindow: NSWindow {
         contentView?.addSubview(hostingView)
 
         updateFrame(for: screen)
-        orderFront(nil)
+        orderFrontRegardless()  // Use orderFrontRegardless to ensure visibility
+        print("[OverlayWindow] Shown on screen: \(screen?.localizedName ?? "main")")
     }
 
     /// Hide the overlay
     func hide() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.hide()
+            }
+            return
+        }
         orderOut(nil)
+        print("[OverlayWindow] Hidden")
     }
 }

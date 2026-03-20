@@ -12,34 +12,32 @@ import Combine
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var menuBarController: MenuBarController?
-    private var overlayWindow: OverlayWindow?
     private var cancellables = Set<AnyCancellable>()
-    private var currentOverlayGeneration: Int = 0  // Track overlay generation to prevent race conditions
+    private var overlayWindows: [String: OverlayWindow] = [:]
+    private var overlayGenerations: [String: Int] = [:]
 
     private let spaceMonitor = SpaceMonitor.shared
     private let spaceConfigManager = SpaceConfigManager.shared
     private let settings = AppSettings.shared
-    private let imageCache = DesktopImageCache.shared
+    private let displayConfigurationMonitor = DisplayConfigurationMonitor.shared
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Setup menu bar
         menuBarController = MenuBarController()
 
-        // Setup overlay window
-        overlayWindow = OverlayWindow()
+        // Activate the current display profile before subscriptions begin.
+        displayConfigurationMonitor.startMonitoring()
+        applyDisplayConfiguration(displayConfigurationMonitor.currentConfiguration)
 
         // Start monitoring space changes
         spaceMonitor.startMonitoring()
 
-        // Initialize image cache (triggers permission check)
-        print("[AppDelegate] ImageCache hasPermission: \(imageCache.hasPermission)")
-
         // Subscribe to space changes
-        spaceMonitor.$spaceChangedAt
+        spaceMonitor.$spaceChangeEvent
             .compactMap { $0 }
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                self?.handleSpaceChange()
+            .sink { [weak self] event in
+                self?.handleSpaceChange(event)
             }
             .store(in: &cancellables)
 
@@ -47,7 +45,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spaceMonitor.$currentSpace
             .receive(on: RunLoop.main)
             .sink { [weak self] space in
-                self?.menuBarController?.updateCurrentSpace(space)
+                guard let self = self else { return }
+                // Keep desktop indices fresh even when macOS auto-reorders Spaces.
+                self.spaceConfigManager.syncWithCurrentSpaces()
+                self.menuBarController?.updateCurrentSpace(space)
+            }
+            .store(in: &cancellables)
+
+        displayConfigurationMonitor.$currentConfiguration
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] configuration in
+                self?.applyDisplayConfiguration(configuration)
             }
             .store(in: &cancellables)
 
@@ -59,26 +68,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         spaceMonitor.stopMonitoring()
+        displayConfigurationMonitor.stopMonitoring()
         print("[AppDelegate] DesktopTitle terminated")
     }
 
     // MARK: - Space Change Handling
 
-    private func handleSpaceChange() {
-        guard let currentSpace = spaceMonitor.currentSpace else {
-            print("[AppDelegate] handleSpaceChange: currentSpace is nil")
+    private func handleSpaceChange(_ event: SpaceChangeEvent) {
+        guard !event.changedSpaces.isEmpty else {
+            print("[AppDelegate] handleSpaceChange: changedSpaces is empty")
             return
         }
 
-        print("[AppDelegate] handleSpaceChange: space \(currentSpace.index), isFullscreen: \(currentSpace.isFullscreen)")
+        // Refresh ordering before resolving the display label.
+        spaceConfigManager.syncWithCurrentSpaces()
 
-        // Skip fullscreen spaces if setting is disabled
-        if currentSpace.isFullscreen && !settings.showForFullscreen {
-            print("[AppDelegate] Skipping fullscreen space")
-            return
+        for space in event.changedSpaces {
+            print("[AppDelegate] handleSpaceChange: space \(space.index), isFullscreen: \(space.isFullscreen), display: \(space.displayID)")
+
+            // Skip fullscreen spaces if setting is disabled
+            if space.isFullscreen && !settings.showForFullscreen {
+                print("[AppDelegate] Skipping fullscreen space")
+                continue
+            }
+
+            showOverlay(for: space)
         }
-
-        showOverlay(for: currentSpace)
     }
 
     private func showOverlay(for space: SpaceInfo) {
@@ -98,17 +113,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         print("[AppDelegate] showOverlay: name=\(spaceName), index=\(space.index), useUnified=\(settings.useUnifiedColors), delay=\(settings.displayDelay)")
 
-        // Increment generation to invalidate any pending hide operations
-        currentOverlayGeneration += 1
-        let thisGeneration = currentOverlayGeneration
+        let nextGeneration = (overlayGenerations[space.displayID] ?? 0) + 1
+        overlayGenerations[space.displayID] = nextGeneration
 
         // Apply display delay if set
         let delay = settings.displayDelay
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, spaceName, space, backgroundColor, textColor, thisGeneration] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, spaceName, space, backgroundColor, textColor, nextGeneration] in
             guard let self = self else { return }
 
             // Check if this overlay is still current (not superseded by another)
-            guard thisGeneration == self.currentOverlayGeneration else {
+            guard nextGeneration == self.overlayGenerations[space.displayID] else {
                 print("[AppDelegate] Skipping stale overlay for space \(space.index)")
                 return
             }
@@ -126,17 +140,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 backgroundColor: backgroundColor,
                 textColor: textColor,
                 fontName: self.settings.fontName,
-                generation: thisGeneration
+                generation: nextGeneration
             ) { [weak self] generation in
                 // Only hide if this overlay is still the current one
-                if self?.currentOverlayGeneration == generation {
-                    self?.overlayWindow?.hide()
+                if self?.overlayGenerations[space.displayID] == generation {
+                    self?.overlayWindows[space.displayID]?.hide()
                 }
             }
 
             let targetScreen = NSScreen.screens.first { $0.displayUUIDString == space.displayID }
-            self.overlayWindow?.show(content: overlayView, on: targetScreen)
+            self.overlayWindow(for: space.displayID).show(content: overlayView, on: targetScreen)
         }
+    }
+
+    private func overlayWindow(for displayID: String) -> OverlayWindow {
+        if let existing = overlayWindows[displayID] {
+            return existing
+        }
+
+        let window = OverlayWindow()
+        overlayWindows[displayID] = window
+        return window
+    }
+
+    private func applyDisplayConfiguration(_ configuration: DisplayConfiguration) {
+        settings.applyDisplayConfiguration(configuration)
+        spaceConfigManager.setActiveProfile(configuration.id)
+
+        let activeDisplayIDs = Set(configuration.orderedDisplayIDs)
+        let staleDisplayIDs = overlayWindows.keys.filter { !activeDisplayIDs.contains($0) }
+        for displayID in staleDisplayIDs {
+            overlayWindows[displayID]?.hide()
+            overlayWindows.removeValue(forKey: displayID)
+            overlayGenerations.removeValue(forKey: displayID)
+        }
+
+        spaceMonitor.updateCurrentSpace()
+        spaceConfigManager.syncWithCurrentSpaces()
+        menuBarController?.updateCurrentSpace(spaceMonitor.currentSpace)
     }
 }
 
@@ -174,6 +215,8 @@ private struct OverlayContentView: View {
                             .font(customFont(size: fontSize * 0.4))
                             .foregroundStyle(textColor.opacity(0.7))
                     }
+
+
                 }
                 .padding(.horizontal, 40)
                 .padding(.vertical, 24)
