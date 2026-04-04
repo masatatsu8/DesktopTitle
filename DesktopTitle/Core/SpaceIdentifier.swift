@@ -62,14 +62,26 @@ final class SpaceIdentifier {
     func getCurrentSpacesByDisplay() -> [String: SpaceInfo] {
         let activeSpaceID = getActiveSpaceID()
         var currentSpaces: [String: SpaceInfo] = [:]
+        var usedFallback = false
 
         for displaySpace in managedDisplaySpaces() {
             if let currentSpace = displaySpace.currentSpace {
                 currentSpaces[displaySpace.displayID] = currentSpace
             } else if let fallback = displaySpace.spaces.first(where: { $0.id == activeSpaceID }) {
                 currentSpaces[displaySpace.displayID] = fallback
+                usedFallback = true
             }
         }
+
+        DebugLog.log(
+            "SpaceIdentifier",
+            "resolved current spaces by display",
+            details: [
+                "activeSpaceID": "\(activeSpaceID)",
+                "usedFallback": "\(usedFallback)",
+                "currentSpaces": DebugLog.describe(spacesByDisplay: currentSpaces)
+            ]
+        )
 
         return currentSpaces
     }
@@ -80,7 +92,7 @@ final class SpaceIdentifier {
         // CGSCopyManagedDisplaySpaces returns CFArrayRef (caller owns it)
         let cfArray: CFArray? = CGSCopyManagedDisplaySpaces(connection)
         guard let cfArray = cfArray else {
-            print("[SpaceIdentifier] CGSCopyManagedDisplaySpaces returned nil")
+            DebugLog.log("SpaceIdentifier", "CGSCopyManagedDisplaySpaces returned nil")
             return []
         }
 
@@ -88,7 +100,13 @@ final class SpaceIdentifier {
         let nsArray = cfArray as NSArray
 
         guard let displaySpaces = nsArray as? [[String: Any]] else {
-            print("[SpaceIdentifier] Failed to cast to [[String: Any]]")
+            DebugLog.log(
+                "SpaceIdentifier",
+                "failed to cast managed display spaces payload",
+                details: [
+                    "payloadType": "\(type(of: nsArray))"
+                ]
+            )
             return []
         }
 
@@ -130,6 +148,21 @@ final class SpaceIdentifier {
                 )
             )
         }
+
+        let summary = managedSpaces
+            .map { displaySpace in
+                let currentSpace = displaySpace.currentSpace.map { "\($0.id)" } ?? "nil"
+                return "display=\(DebugLog.shortDisplayID(displaySpace.displayID)),spaces=\(displaySpace.spaces.count),currentSpaceID=\(currentSpace)"
+            }
+            .joined(separator: "; ")
+        DebugLog.log(
+            "SpaceIdentifier",
+            "parsed managed display spaces",
+            details: [
+                "displayCount": "\(managedSpaces.count)",
+                "summary": summary
+            ]
+        )
 
         return managedSpaces
     }

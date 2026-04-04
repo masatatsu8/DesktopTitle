@@ -10,6 +10,7 @@ import SwiftUI
 import Combine
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static weak var shared: AppDelegate?
 
     private var menuBarController: MenuBarController?
     private var cancellables = Set<AnyCancellable>()
@@ -22,6 +23,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let displayConfigurationMonitor = DisplayConfigurationMonitor.shared
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Self.shared = self
+        DebugLog.beginSession()
+
         // Setup menu bar
         menuBarController = MenuBarController()
 
@@ -63,32 +67,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Initial sync
         spaceConfigManager.syncWithCurrentSpaces()
 
-        print("[AppDelegate] DesktopTitle started")
+        DebugLog.log(
+            "AppDelegate",
+            "DesktopTitle started",
+            details: [
+                "currentConfiguration": settings.currentProfileSummary,
+                "initialCurrentSpace": DebugLog.describe(space: spaceMonitor.currentSpace),
+                "logFile": DebugLog.filePath
+            ]
+        )
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        Self.shared = nil
         spaceMonitor.stopMonitoring()
         displayConfigurationMonitor.stopMonitoring()
-        print("[AppDelegate] DesktopTitle terminated")
+        DebugLog.log("AppDelegate", "DesktopTitle terminated")
     }
 
     // MARK: - Space Change Handling
 
     private func handleSpaceChange(_ event: SpaceChangeEvent) {
         guard !event.changedSpaces.isEmpty else {
-            print("[AppDelegate] handleSpaceChange: changedSpaces is empty")
+            DebugLog.log(
+                "AppDelegate",
+                "space change ignored because changedSpaces was empty",
+                details: [
+                    "trigger": event.trigger,
+                    "allCurrentSpaces": DebugLog.describe(spacesByDisplay: event.allCurrentSpaces)
+                ]
+            )
             return
         }
 
         // Refresh ordering before resolving the display label.
         spaceConfigManager.syncWithCurrentSpaces()
 
+        DebugLog.log(
+            "AppDelegate",
+            "handling space change event",
+            details: [
+                "trigger": event.trigger,
+                "occurredAt": ISO8601DateFormatter().string(from: event.occurredAt),
+                "changedSpaces": DebugLog.describe(spaces: event.changedSpaces),
+                "allCurrentSpaces": DebugLog.describe(spacesByDisplay: event.allCurrentSpaces),
+                "showForFullscreen": "\(settings.showForFullscreen)"
+            ]
+        )
+
         for space in event.changedSpaces {
-            print("[AppDelegate] handleSpaceChange: space \(space.index), isFullscreen: \(space.isFullscreen), display: \(space.displayID)")
+            DebugLog.log(
+                "AppDelegate",
+                "processing changed space",
+                details: [
+                    "space": DebugLog.describe(space: space)
+                ]
+            )
 
             // Skip fullscreen spaces if setting is disabled
             if space.isFullscreen && !settings.showForFullscreen {
-                print("[AppDelegate] Skipping fullscreen space")
+                DebugLog.log(
+                    "AppDelegate",
+                    "skipping fullscreen space because setting is disabled",
+                    details: [
+                        "space": DebugLog.describe(space: space)
+                    ]
+                )
                 continue
             }
 
@@ -96,7 +140,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func showOverlay(for space: SpaceInfo) {
+    func showPreviewOverlay(for previewSpace: SpaceInfo? = nil) {
+        guard let space = previewSpace ?? spaceMonitor.currentSpace else {
+            DebugLog.log("AppDelegate", "preview overlay request ignored because there was no current space")
+            return
+        }
+
+        DebugLog.log(
+            "AppDelegate",
+            "preview overlay requested",
+            details: [
+                "space": DebugLog.describe(space: space)
+            ]
+        )
+        showOverlay(for: space, delayOverride: 0)
+    }
+
+    private func showOverlay(for space: SpaceInfo, delayOverride: Double? = nil) {
         let spaceName = spaceConfigManager.getDisplayName(for: space)
 
         // Determine colors based on unified/per-desktop setting
@@ -111,27 +171,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             textColor = spaceConfigManager.getTextColor(for: space) ?? settings.textColor
         }
 
-        print("[AppDelegate] showOverlay: name=\(spaceName), index=\(space.index), useUnified=\(settings.useUnifiedColors), delay=\(settings.displayDelay)")
-
         let nextGeneration = (overlayGenerations[space.displayID] ?? 0) + 1
         overlayGenerations[space.displayID] = nextGeneration
 
         // Apply display delay if set
-        let delay = settings.displayDelay
+        let delay = delayOverride ?? settings.displayDelay
+        DebugLog.log(
+            "AppDelegate",
+            "overlay scheduled",
+            details: [
+                "space": DebugLog.describe(space: space),
+                "spaceName": spaceName,
+                "generation": "\(nextGeneration)",
+                "delay": String(format: "%.3f", delay),
+                "displayDuration": String(format: "%.3f", settings.displayDuration),
+                "showIndex": "\(settings.showSpaceIndex)",
+                "fontSize": String(format: "%.1f", settings.fontSize),
+                "position": String(format: "(%.3f, %.3f)", settings.positionX, settings.positionY),
+                "useUnifiedColors": "\(settings.useUnifiedColors)",
+                "backgroundColor": DebugLog.describe(color: backgroundColor),
+                "textColor": DebugLog.describe(color: textColor),
+                "nsAppActive": "\(NSApp.isActive)"
+            ]
+        )
+
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, spaceName, space, backgroundColor, textColor, nextGeneration] in
             guard let self = self else { return }
 
             // Check if this overlay is still current (not superseded by another)
             guard nextGeneration == self.overlayGenerations[space.displayID] else {
-                print("[AppDelegate] Skipping stale overlay for space \(space.index)")
+                DebugLog.log(
+                    "AppDelegate",
+                    "overlay became stale before display",
+                    details: [
+                        "space": DebugLog.describe(space: space),
+                        "requestedGeneration": "\(nextGeneration)",
+                        "currentGeneration": "\(self.overlayGenerations[space.displayID] ?? -1)"
+                    ]
+                )
                 return
             }
 
-            print("[AppDelegate] Showing overlay now for space \(space.index)")
+            let targetScreen = NSScreen.screens.first { $0.displayUUIDString == space.displayID }
+            DebugLog.log(
+                "AppDelegate",
+                "overlay delay elapsed; preparing window show",
+                details: [
+                    "space": DebugLog.describe(space: space),
+                    "generation": "\(nextGeneration)",
+                    "targetScreen": DebugLog.describe(screen: targetScreen)
+                ]
+            )
+
+            // Close previous overlay window for this display (if any)
+            if let oldWindow = self.overlayWindows[space.displayID] {
+                oldWindow.hide(reason: "replacedByNewGeneration=\(nextGeneration)")
+                self.overlayWindows.removeValue(forKey: space.displayID)
+            }
+
+            // Create a fresh window on the current space
+            let window = OverlayWindow(displayID: space.displayID)
+            self.overlayWindows[space.displayID] = window
 
             let overlayView = OverlayContentView(
                 spaceName: spaceName,
                 spaceIndex: space.index,
+                displayID: space.displayID,
                 showIndex: self.settings.showSpaceIndex,
                 fontSize: self.settings.fontSize,
                 displayDuration: self.settings.displayDuration,
@@ -142,35 +247,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 fontName: self.settings.fontName,
                 generation: nextGeneration
             ) { [weak self] generation in
-                // Only hide if this overlay is still the current one
+                // Only hide/destroy if this overlay is still the current one
                 if self?.overlayGenerations[space.displayID] == generation {
-                    self?.overlayWindows[space.displayID]?.hide()
+                    DebugLog.log(
+                        "AppDelegate",
+                        "overlay completion requested hide",
+                        details: [
+                            "space": DebugLog.describe(space: space),
+                            "generation": "\(generation)"
+                        ]
+                    )
+                    self?.overlayWindows[space.displayID]?.hide(reason: "animationCompleted generation=\(generation)")
+                    self?.overlayWindows.removeValue(forKey: space.displayID)
+                } else {
+                    DebugLog.log(
+                        "AppDelegate",
+                        "overlay completion skipped hide because generation advanced",
+                        details: [
+                            "space": DebugLog.describe(space: space),
+                            "completionGeneration": "\(generation)",
+                            "currentGeneration": "\(self?.overlayGenerations[space.displayID] ?? -1)"
+                        ]
+                    )
                 }
             }
 
-            let targetScreen = NSScreen.screens.first { $0.displayUUIDString == space.displayID }
-            self.overlayWindow(for: space.displayID).show(content: overlayView, on: targetScreen)
+            window.show(content: overlayView, on: targetScreen)
         }
-    }
-
-    private func overlayWindow(for displayID: String) -> OverlayWindow {
-        if let existing = overlayWindows[displayID] {
-            return existing
-        }
-
-        let window = OverlayWindow()
-        overlayWindows[displayID] = window
-        return window
     }
 
     private func applyDisplayConfiguration(_ configuration: DisplayConfiguration) {
+        DebugLog.log(
+            "AppDelegate",
+            "applying display configuration",
+            details: [
+                "configurationID": configuration.id,
+                "summary": configuration.summary,
+                "orderedDisplays": configuration.orderedDisplayIDs.joined(separator: ", ")
+            ]
+        )
         settings.applyDisplayConfiguration(configuration)
-        spaceConfigManager.setActiveProfile(configuration.id)
+        spaceConfigManager.setActiveProfile(
+            configuration.id,
+            mode: settings.profileMode,
+            baseProfileID: settings.baseProfileID
+        )
 
         let activeDisplayIDs = Set(configuration.orderedDisplayIDs)
         let staleDisplayIDs = overlayWindows.keys.filter { !activeDisplayIDs.contains($0) }
         for displayID in staleDisplayIDs {
-            overlayWindows[displayID]?.hide()
+            DebugLog.log(
+                "AppDelegate",
+                "removing stale overlay window for inactive display",
+                details: [
+                    "display": DebugLog.shortDisplayID(displayID)
+                ]
+            )
+            overlayWindows[displayID]?.hide(reason: "displayConfigurationChanged")
             overlayWindows.removeValue(forKey: displayID)
             overlayGenerations.removeValue(forKey: displayID)
         }
@@ -187,6 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 private struct OverlayContentView: View {
     let spaceName: String
     let spaceIndex: Int
+    let displayID: String
     let showIndex: Bool
     let fontSize: CGFloat
     let displayDuration: Double
@@ -234,6 +368,18 @@ private struct OverlayContentView: View {
             }
         }
         .onAppear {
+            DebugLog.log(
+                "OverlayView",
+                "overlay content appeared",
+                details: [
+                    "spaceName": spaceName,
+                    "spaceIndex": "\(spaceIndex)",
+                    "display": DebugLog.shortDisplayID(displayID),
+                    "generation": "\(generation)",
+                    "displayDuration": String(format: "%.3f", displayDuration)
+                ]
+            )
+
             // Fade in
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                 opacity = 1
@@ -243,6 +389,16 @@ private struct OverlayContentView: View {
             // Schedule fade out
             let gen = generation
             DispatchQueue.main.asyncAfter(deadline: .now() + displayDuration) {
+                DebugLog.log(
+                    "OverlayView",
+                    "starting overlay fade out",
+                    details: [
+                        "spaceName": spaceName,
+                        "spaceIndex": "\(spaceIndex)",
+                        "display": DebugLog.shortDisplayID(displayID),
+                        "generation": "\(gen)"
+                    ]
+                )
                 withAnimation(.easeOut(duration: 0.3)) {
                     opacity = 0
                     scale = 0.9
@@ -250,9 +406,27 @@ private struct OverlayContentView: View {
 
                 // Hide window after animation
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    DebugLog.log(
+                        "OverlayView",
+                        "fade out completed; invoking overlay completion",
+                        details: [
+                            "display": DebugLog.shortDisplayID(displayID),
+                            "generation": "\(gen)"
+                        ]
+                    )
                     onComplete(gen)
                 }
             }
+        }
+        .onDisappear {
+            DebugLog.log(
+                "OverlayView",
+                "overlay content disappeared",
+                details: [
+                    "display": DebugLog.shortDisplayID(displayID),
+                    "generation": "\(generation)"
+                ]
+            )
         }
     }
 

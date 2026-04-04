@@ -33,6 +33,7 @@ final class SpaceMonitor: ObservableObject {
     private let spaceIdentifier = SpaceIdentifier.shared
     private var isMonitoring = false
     private var pendingResolveWorkItem: DispatchWorkItem?
+    private var resolutionSequence = 0
 
     private let resolutionDelay: TimeInterval = 0.08
     private let maxResolutionAttempts = 5
@@ -83,7 +84,7 @@ final class SpaceMonitor: ObservableObject {
             object: nil
         )
 
-        print("[SpaceMonitor] Started monitoring space changes")
+        DebugLog.log("SpaceMonitor", "started monitoring space changes")
     }
 
     /// Stop monitoring Space changes
@@ -123,16 +124,24 @@ final class SpaceMonitor: ObservableObject {
             object: nil
         )
 
-        print("[SpaceMonitor] Stopped monitoring space changes")
+        DebugLog.log("SpaceMonitor", "stopped monitoring space changes")
     }
 
     /// Force update current space info
     func updateCurrentSpace() {
         let newSpaces = spaceIdentifier.getCurrentSpacesByDisplay()
         guard !newSpaces.isEmpty else {
-            print("[SpaceMonitor] updateCurrentSpace: failed to resolve current spaces")
+            DebugLog.log("SpaceMonitor", "updateCurrentSpace failed to resolve any spaces")
             return
         }
+
+        DebugLog.log(
+            "SpaceMonitor",
+            "updateCurrentSpace resolved spaces",
+            details: [
+                "spaces": DebugLog.describe(spacesByDisplay: newSpaces)
+            ]
+        )
 
         if Thread.isMainThread {
             applyResolvedSpaces(newSpaces, trigger: nil)
@@ -146,50 +155,109 @@ final class SpaceMonitor: ObservableObject {
     // MARK: - Notification Handlers
 
     @objc private func spaceDidChange(_ notification: Notification) {
-        pendingResolveWorkItem?.cancel()
-        pendingResolveWorkItem = nil
-        resolveCurrentSpaceWithRetry(attempt: 0, trigger: "spaceDidChange")
+        requestResolution(trigger: "spaceDidChange")
     }
 
     @objc private func appDidBecomeActive(_ notification: Notification) {
         // Refresh space info when app becomes active
-        pendingResolveWorkItem?.cancel()
-        pendingResolveWorkItem = nil
-        resolveCurrentSpaceWithRetry(attempt: 0, trigger: "appDidBecomeActive")
+        requestResolution(trigger: "appDidBecomeActive")
     }
 
     @objc private func screenParametersDidChange(_ notification: Notification) {
-        pendingResolveWorkItem?.cancel()
-        pendingResolveWorkItem = nil
-        resolveCurrentSpaceWithRetry(attempt: 0, trigger: "didChangeScreenParameters")
+        requestResolution(trigger: "didChangeScreenParameters")
     }
 
     @objc private func workspaceDidWake(_ notification: Notification) {
-        pendingResolveWorkItem?.cancel()
-        pendingResolveWorkItem = nil
-        resolveCurrentSpaceWithRetry(attempt: 0, trigger: "workspaceDidWake")
+        requestResolution(trigger: "workspaceDidWake")
     }
 
     // MARK: - Internal
 
-    private func resolveCurrentSpaceWithRetry(attempt: Int, trigger: String) {
+    private func requestResolution(trigger: String) {
+        if pendingResolveWorkItem != nil {
+            DebugLog.log(
+                "SpaceMonitor",
+                "cancelling pending resolution before starting a new one",
+                details: [
+                    "trigger": trigger
+                ]
+            )
+        }
+
+        pendingResolveWorkItem?.cancel()
+        pendingResolveWorkItem = nil
+        resolutionSequence += 1
+
+        DebugLog.log(
+            "SpaceMonitor",
+            "resolution requested",
+            details: [
+                "trigger": trigger,
+                "sequence": "\(resolutionSequence)"
+            ]
+        )
+
+        resolveCurrentSpaceWithRetry(attempt: 0, trigger: trigger, sequence: resolutionSequence)
+    }
+
+    private func resolveCurrentSpaceWithRetry(attempt: Int, trigger: String, sequence: Int) {
+        DebugLog.log(
+            "SpaceMonitor",
+            "attempting to resolve current spaces",
+            details: [
+                "trigger": trigger,
+                "sequence": "\(sequence)",
+                "attempt": "\(attempt)"
+            ]
+        )
+
         let newSpaces = spaceIdentifier.getCurrentSpacesByDisplay()
         guard !newSpaces.isEmpty else {
             if attempt < maxResolutionAttempts {
                 let workItem = DispatchWorkItem { [weak self] in
-                    self?.resolveCurrentSpaceWithRetry(attempt: attempt + 1, trigger: trigger)
+                    self?.resolveCurrentSpaceWithRetry(attempt: attempt + 1, trigger: trigger, sequence: sequence)
                 }
                 pendingResolveWorkItem = workItem
+                DebugLog.log(
+                    "SpaceMonitor",
+                    "space resolution returned no spaces; scheduling retry",
+                    details: [
+                        "trigger": trigger,
+                        "sequence": "\(sequence)",
+                        "attempt": "\(attempt)",
+                        "nextAttempt": "\(attempt + 1)",
+                        "delaySeconds": String(format: "%.3f", resolutionDelay)
+                    ]
+                )
                 DispatchQueue.main.asyncAfter(deadline: .now() + resolutionDelay, execute: workItem)
             } else {
                 // Keep previous state instead of publishing nil
-                print("[SpaceMonitor] Failed to resolve current space after \(trigger); keeping previous state")
+                DebugLog.log(
+                    "SpaceMonitor",
+                    "failed to resolve current spaces after retries; keeping previous state",
+                    details: [
+                        "trigger": trigger,
+                        "sequence": "\(sequence)",
+                        "attempt": "\(attempt)"
+                    ]
+                )
             }
             return
         }
 
         pendingResolveWorkItem?.cancel()
         pendingResolveWorkItem = nil
+
+        DebugLog.log(
+            "SpaceMonitor",
+            "resolved current spaces",
+            details: [
+                "trigger": trigger,
+                "sequence": "\(sequence)",
+                "attempt": "\(attempt)",
+                "spaces": DebugLog.describe(spacesByDisplay: newSpaces)
+            ]
+        )
 
         if Thread.isMainThread {
             applyResolvedSpaces(newSpaces, trigger: trigger)
@@ -221,6 +289,18 @@ final class SpaceMonitor: ObservableObject {
             currentSpace = preferredSpace(from: Array(newSpaces.values))
         }
 
+        DebugLog.log(
+            "SpaceMonitor",
+            "applied resolved spaces",
+            details: [
+                "trigger": trigger,
+                "previousSpaces": DebugLog.describe(spacesByDisplay: previousSpaces),
+                "newSpaces": DebugLog.describe(spacesByDisplay: newSpaces),
+                "changedSpaces": DebugLog.describe(spaces: changedSpaces),
+                "currentSpace": DebugLog.describe(space: currentSpace)
+            ]
+        )
+
         guard let trigger, !changedSpaces.isEmpty else { return }
 
         let event = SpaceChangeEvent(
@@ -230,11 +310,6 @@ final class SpaceMonitor: ObservableObject {
             trigger: trigger
         )
         spaceChangeEvent = event
-
-        let summary = changedSpaces
-            .map { "\($0.index)@\($0.displayID.prefix(6))" }
-            .joined(separator: ", ")
-        print("[SpaceMonitor] Spaces changed after \(trigger): \(summary)")
     }
 
     private func preferredSpace(from spaces: [SpaceInfo]) -> SpaceInfo? {

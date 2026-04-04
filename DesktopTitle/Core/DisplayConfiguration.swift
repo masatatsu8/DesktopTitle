@@ -17,6 +17,14 @@ extension NSScreen {
         return Self.displayUUIDString(for: screenNumber)
     }
 
+    /// Whether this screen is the built-in display (e.g. MacBook Pro's internal screen).
+    var isBuiltIn: Bool {
+        guard let screenNumber = deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+            return false
+        }
+        return CGDisplayIsBuiltin(screenNumber) != 0
+    }
+
     static func displayUUIDString(for displayID: CGDirectDisplayID) -> String? {
         guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else {
             return nil
@@ -28,10 +36,12 @@ extension NSScreen {
 struct DisplayScreenInfo: Codable, Equatable, Identifiable {
     let id: String
     let name: String
+    let isBuiltIn: Bool
 
-    init(id: String, name: String) {
+    init(id: String, name: String, isBuiltIn: Bool = false) {
         self.id = id
         self.name = name
+        self.isBuiltIn = isBuiltIn
     }
 }
 
@@ -41,6 +51,15 @@ struct DisplayConfiguration: Codable, Equatable, Identifiable {
 
     var orderedDisplayIDs: [String] {
         displays.map(\.id)
+    }
+
+    var isMultiDisplay: Bool {
+        displays.count > 1
+    }
+
+    /// The UUID of the built-in display, if present.
+    var builtInDisplayID: String? {
+        displays.first(where: \.isBuiltIn)?.id
     }
 
     var summary: String {
@@ -53,7 +72,7 @@ struct DisplayConfiguration: Codable, Equatable, Identifiable {
     static func current() -> DisplayConfiguration {
         let screens = NSScreen.screens.compactMap { screen -> DisplayScreenInfo? in
             guard let id = screen.displayUUIDString else { return nil }
-            return DisplayScreenInfo(id: id, name: screen.localizedName)
+            return DisplayScreenInfo(id: id, name: screen.localizedName, isBuiltIn: screen.isBuiltIn)
         }
 
         let profileKey = screens
@@ -105,6 +124,14 @@ final class DisplayConfigurationMonitor: ObservableObject {
         )
 
         refreshCurrentConfiguration()
+        DebugLog.log(
+            "DisplayConfiguration",
+            "started monitoring display configuration",
+            details: [
+                "currentConfigurationID": currentConfiguration.id,
+                "summary": currentConfiguration.summary
+            ]
+        )
     }
 
     func stopMonitoring() {
@@ -128,13 +155,36 @@ final class DisplayConfigurationMonitor: ObservableObject {
             name: NSWorkspace.screensDidWakeNotification,
             object: nil
         )
+
+        DebugLog.log("DisplayConfiguration", "stopped monitoring display configuration")
     }
 
     func refreshCurrentConfiguration() {
         let configuration = DisplayConfiguration.current()
-        guard configuration != currentConfiguration else { return }
+        guard configuration != currentConfiguration else {
+            DebugLog.log(
+                "DisplayConfiguration",
+                "display configuration refresh produced no change",
+                details: [
+                    "configurationID": configuration.id,
+                    "summary": configuration.summary
+                ]
+            )
+            return
+        }
+
+        let previousConfiguration = currentConfiguration
         currentConfiguration = configuration
-        print("[DisplayConfigurationMonitor] Active configuration: \(configuration.summary)")
+        DebugLog.log(
+            "DisplayConfiguration",
+            "active display configuration changed",
+            details: [
+                "previousID": previousConfiguration.id,
+                "previousSummary": previousConfiguration.summary,
+                "currentID": configuration.id,
+                "currentSummary": configuration.summary
+            ]
+        )
     }
 
     @objc private func screenParametersDidChange(_ notification: Notification) {

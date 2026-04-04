@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		17C2049AB34D23FF2A9EA457 /* DesktopTitleApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 511B85EB7ECE0B7C22E27358 /* DesktopTitleApp.swift */; };
 		363F896806BE34E49279184E /* DisplayConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8175982F31290F111A7AFBC /* DisplayConfiguration.swift */; };
+		36CC0A8CF7194E4D2645480A /* DebugLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2992ED3E5A6FD7C511B73AB /* DebugLog.swift */; };
 		39462AEA0358CD83DE24E209 /* SpaceMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F25CF862EE76762D5237DEB9 /* SpaceMonitor.swift */; };
 		3B2E1C394EC6F06FFF140D76 /* OverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54810920380BA2B1C3D9B6AB /* OverlayView.swift */; };
 		4395A22BD681963424EF6572 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 104360C011FCE49479F69AFD /* Assets.xcassets */; };
@@ -35,6 +36,7 @@
 		7CAAFB057C4C3E96E221CC4C /* MenuBarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarController.swift; sourceTree = "<group>"; };
 		B3DF1EB730A2BC509CD80C2F /* DesktopTitle-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "DesktopTitle-Bridging-Header.h"; sourceTree = "<group>"; };
 		C8175982F31290F111A7AFBC /* DisplayConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayConfiguration.swift; sourceTree = "<group>"; };
+		D2992ED3E5A6FD7C511B73AB /* DebugLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLog.swift; sourceTree = "<group>"; };
 		E537F6AB1A07EA0AE1B8173C /* OverlayWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayWindow.swift; sourceTree = "<group>"; };
 		F25CF862EE76762D5237DEB9 /* SpaceMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceMonitor.swift; sourceTree = "<group>"; };
 		FC4489D3134E7C612AB636DB /* DesktopTitle.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DesktopTitle.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -64,6 +66,7 @@
 			isa = PBXGroup;
 			children = (
 				04F17A13DBB23D4B86A5B5A7 /* CGSPrivate.h */,
+				D2992ED3E5A6FD7C511B73AB /* DebugLog.swift */,
 				C8175982F31290F111A7AFBC /* DisplayConfiguration.swift */,
 				5E48F91A72EFD2AE9693FC90 /* SpaceIdentifier.swift */,
 				F25CF862EE76762D5237DEB9 /* SpaceMonitor.swift */,
@@ -193,6 +196,7 @@
 				97A84B3E8423857AD1C50112 /* AppDelegate.swift in Sources */,
 				48C9E79EA1A7417AE7156E0D /* AppSettings.swift in Sources */,
 				17C2049AB34D23FF2A9EA457 /* DesktopTitleApp.swift in Sources */,
+				36CC0A8CF7194E4D2645480A /* DebugLog.swift in Sources */,
 				363F896806BE34E49279184E /* DisplayConfiguration.swift in Sources */,
 				BA82B17C0220580D54A0DBF8 /* MenuBarController.swift in Sources */,
 				3B2E1C394EC6F06FFF140D76 /* OverlayView.swift in Sources */,

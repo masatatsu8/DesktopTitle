@@ -80,9 +80,16 @@ struct SettingsView: View {
                                         .foregroundStyle(isCurrent ? .blue : .secondary)
                                     if NSScreen.screens.count > 1,
                                        let screenName = NSScreen.screens.first(where: { $0.displayUUIDString == space.displayID })?.localizedName {
-                                        Text(screenName)
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
+                                        HStack(spacing: 4) {
+                                            Text(screenName)
+                                                .font(.caption2)
+                                                .foregroundStyle(.tertiary)
+                                            if spaceConfigManager.isInheritedSpace(space) {
+                                                Text("(shared)")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.blue)
+                                            }
+                                        }
                                     }
                                 }
                                 .frame(width: 100, alignment: .leading)
@@ -156,6 +163,19 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Text(settings.currentProfileSummary)
+                    }
+
+                    if settings.isMultiDisplay {
+                        Picker("Profile Mode", selection: profileModeBinding) {
+                            Text("Inherit from built-in display").tag(ProfileMode.inherit)
+                            Text("Independent").tag(ProfileMode.independent)
+                        }
+
+                        if settings.profileMode == .inherit {
+                            Text("Display settings are shared with the built-in display profile. Changes here also apply when using the built-in display only.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 } header: {
                     Text("Profile")
@@ -268,6 +288,17 @@ struct SettingsView: View {
             .formStyle(.grouped)
         }
         .padding()
+        .onChange(of: settings.useUnifiedColors) { _, _ in
+            requestOverlayPreview()
+        }
+        .onChange(of: settings.textColor) { _, _ in
+            guard settings.useUnifiedColors else { return }
+            requestOverlayPreview()
+        }
+        .onChange(of: settings.backgroundColor) { _, _ in
+            guard settings.useUnifiedColors else { return }
+            requestOverlayPreview()
+        }
     }
 
     private func positionLabel(_ value: Double, axis: String) -> String {
@@ -333,7 +364,7 @@ struct SettingsView: View {
             }
 
             Section {
-                Text("Display settings and desktop names are stored per display configuration.")
+                Text("Display settings and desktop names are stored per display configuration. Multi-display configurations can inherit settings from the built-in display profile or use independent settings.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -361,6 +392,22 @@ struct SettingsView: View {
 
     // MARK: - Helper Methods
 
+    private var profileModeBinding: Binding<ProfileMode> {
+        Binding(
+            get: { settings.profileMode },
+            set: { newValue in
+                settings.setProfileMode(newValue)
+                // Re-sync SpaceConfigManager with new mode
+                spaceConfigManager.setActiveProfile(
+                    settings.currentConfiguration.id,
+                    mode: settings.profileMode,
+                    baseProfileID: settings.baseProfileID
+                )
+                refreshSpaces()
+            }
+        )
+    }
+
     private func binding(for space: SpaceInfo) -> Binding<String> {
         Binding(
             get: {
@@ -368,7 +415,7 @@ struct SettingsView: View {
             },
             set: { newValue in
                 spaceNames[space.id] = newValue
-                spaceConfigManager.setName(newValue, for: space.id, displayIndex: space.index)
+                spaceConfigManager.setName(newValue, for: space.id, displayIndex: space.index, displayID: space.displayID)
             }
         )
     }
@@ -381,7 +428,8 @@ struct SettingsView: View {
             set: { newValue in
                 spaceBackgroundColors[space.id] = newValue
                 let textColor = spaceTextColors[space.id] ?? spaceConfigManager.getTextColor(for: space)
-                spaceConfigManager.setColors(backgroundColor: newValue, textColor: textColor, for: space.id, displayIndex: space.index)
+                spaceConfigManager.setColors(backgroundColor: newValue, textColor: textColor, for: space.id, displayIndex: space.index, displayID: space.displayID)
+                requestOverlayPreview(for: space)
             }
         )
     }
@@ -394,9 +442,21 @@ struct SettingsView: View {
             set: { newValue in
                 spaceTextColors[space.id] = newValue
                 let bgColor = spaceBackgroundColors[space.id] ?? spaceConfigManager.getBackgroundColor(for: space)
-                spaceConfigManager.setColors(backgroundColor: bgColor, textColor: newValue, for: space.id, displayIndex: space.index)
+                spaceConfigManager.setColors(backgroundColor: bgColor, textColor: newValue, for: space.id, displayIndex: space.index, displayID: space.displayID)
+                requestOverlayPreview(for: space)
             }
         )
+    }
+
+    private func requestOverlayPreview(for space: SpaceInfo? = nil) {
+        DebugLog.log(
+            "SettingsView",
+            "requested overlay preview from settings",
+            details: [
+                "space": DebugLog.describe(space: space)
+            ]
+        )
+        AppDelegate.shared?.showPreviewOverlay(for: space)
     }
 
     private func refreshSpaces() {

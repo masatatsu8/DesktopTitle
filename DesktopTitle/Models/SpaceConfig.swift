@@ -67,18 +67,65 @@ final class SpaceConfigManager: ObservableObject {
     private let userDefaultsKey = "SpaceConfigs"
     private var configsByProfile: [String: [UInt64: SpaceConfig]] = [:]
     private var activeProfileID: String = DisplayConfiguration.current().id
+    private var currentMode: ProfileMode = .independent
+    private var currentBaseProfileID: String?
+    /// Display IDs that belong to the base profile (used in inherit mode)
+    private var baseDisplayIDs: Set<String> = []
 
     private init() {
         loadConfigs()
         configs = configsByProfile[activeProfileID] ?? [:]
     }
 
-    func setActiveProfile(_ profileID: String) {
-        guard profileID != activeProfileID else { return }
-        configsByProfile[activeProfileID] = configs
+    func setActiveProfile(_ profileID: String, mode: ProfileMode = .independent, baseProfileID: String? = nil) {
+        // Save current configs before switching
+        saveCurrentConfigs()
+
         activeProfileID = profileID
-        configs = configsByProfile[profileID] ?? [:]
+        currentMode = mode
+        currentBaseProfileID = baseProfileID
+
+        // Determine which display IDs belong to the base profile
+        if mode == .inherit, let baseID = baseProfileID {
+            // The base profile ID is a single display UUID
+            baseDisplayIDs = Set([baseID])
+        } else {
+            baseDisplayIDs = []
+        }
+
+        rebuildMergedConfigs()
         saveConfigs()
+    }
+
+    /// Get the effective profile ID for a given space based on which display it's on.
+    private func effectiveProfileID(for displayID: String) -> String {
+        if currentMode == .inherit, let baseID = currentBaseProfileID,
+           baseDisplayIDs.contains(displayID) {
+            return baseID
+        }
+        return activeProfileID
+    }
+
+    /// Rebuild the merged configs view from base + own profiles.
+    private func rebuildMergedConfigs() {
+        if currentMode == .inherit, let baseID = currentBaseProfileID {
+            var merged: [UInt64: SpaceConfig] = [:]
+            // Add base profile's configs (for built-in display spaces)
+            if let baseConfigs = configsByProfile[baseID] {
+                for (id, config) in baseConfigs {
+                    merged[id] = config
+                }
+            }
+            // Add own configs (for external display spaces)
+            if let ownConfigs = configsByProfile[activeProfileID] {
+                for (id, config) in ownConfigs {
+                    merged[id] = config
+                }
+            }
+            configs = merged
+        } else {
+            configs = configsByProfile[activeProfileID] ?? [:]
+        }
     }
 
     /// Get or create config for a space
@@ -87,7 +134,6 @@ final class SpaceConfigManager: ObservableObject {
             return existing
         }
 
-        // Create default config
         let config = SpaceConfig(
             id: spaceInfo.id,
             name: "",
@@ -97,20 +143,31 @@ final class SpaceConfigManager: ObservableObject {
     }
 
     /// Update the name for a space
-    func setName(_ name: String, for spaceID: UInt64, displayIndex: Int) {
+    func setName(_ name: String, for spaceID: UInt64, displayIndex: Int, displayID: String? = nil) {
         var config = configs[spaceID] ?? SpaceConfig(id: spaceID, displayIndex: displayIndex)
         config.name = name
         configs[spaceID] = config
-        saveConfigs()
+
+        // Route to the correct profile
+        let profileID = displayID.map { effectiveProfileID(for: $0) } ?? activeProfileID
+        var profileConfigs = configsByProfile[profileID] ?? [:]
+        profileConfigs[spaceID] = config
+        configsByProfile[profileID] = profileConfigs
+        persistConfigs()
     }
 
     /// Update colors for a space
-    func setColors(backgroundColor: Color?, textColor: Color?, for spaceID: UInt64, displayIndex: Int) {
+    func setColors(backgroundColor: Color?, textColor: Color?, for spaceID: UInt64, displayIndex: Int, displayID: String? = nil) {
         var config = configs[spaceID] ?? SpaceConfig(id: spaceID, displayIndex: displayIndex)
         config.backgroundColor = backgroundColor.map { CodableColor($0) }
         config.textColor = textColor.map { CodableColor($0) }
         configs[spaceID] = config
-        saveConfigs()
+
+        let profileID = displayID.map { effectiveProfileID(for: $0) } ?? activeProfileID
+        var profileConfigs = configsByProfile[profileID] ?? [:]
+        profileConfigs[spaceID] = config
+        configsByProfile[profileID] = profileConfigs
+        persistConfigs()
     }
 
     /// Get background color for a space (returns nil if not set)
@@ -144,6 +201,10 @@ final class SpaceConfigManager: ObservableObject {
             if var config = configs[space.id] {
                 config.displayIndex = space.index
                 configs[space.id] = config
+
+                // Update in the correct underlying profile
+                let profileID = effectiveProfileID(for: space.displayID)
+                configsByProfile[profileID]?[space.id] = config
             }
         }
 
@@ -151,6 +212,11 @@ final class SpaceConfigManager: ObservableObject {
         configs = configs.filter { currentIDs.contains($0.key) }
 
         saveConfigs()
+    }
+
+    /// Whether a space belongs to the base (inherited) profile
+    func isInheritedSpace(_ spaceInfo: SpaceInfo) -> Bool {
+        currentMode == .inherit && baseDisplayIDs.contains(spaceInfo.displayID)
     }
 
     // MARK: - Persistence
@@ -170,8 +236,36 @@ final class SpaceConfigManager: ObservableObject {
         }
     }
 
+    /// Save current merged configs back to the correct underlying profiles.
+    private func saveCurrentConfigs() {
+        if currentMode == .inherit, let baseID = currentBaseProfileID {
+            var baseConfigs: [UInt64: SpaceConfig] = configsByProfile[baseID] ?? [:]
+            var ownConfigs: [UInt64: SpaceConfig] = configsByProfile[activeProfileID] ?? [:]
+
+            for (spaceID, config) in configs {
+                // Determine which profile this space belongs to by checking all spaces
+                let allSpaces = SpaceIdentifier.shared.getAllSpaces()
+                if let space = allSpaces.first(where: { $0.id == spaceID }),
+                   baseDisplayIDs.contains(space.displayID) {
+                    baseConfigs[spaceID] = config
+                } else {
+                    ownConfigs[spaceID] = config
+                }
+            }
+
+            configsByProfile[baseID] = baseConfigs
+            configsByProfile[activeProfileID] = ownConfigs
+        } else {
+            configsByProfile[activeProfileID] = configs
+        }
+    }
+
     private func saveConfigs() {
-        configsByProfile[activeProfileID] = configs
+        saveCurrentConfigs()
+        persistConfigs()
+    }
+
+    private func persistConfigs() {
         guard let data = try? JSONEncoder().encode(SpaceConfigStore(profiles: configsByProfile)) else {
             return
         }

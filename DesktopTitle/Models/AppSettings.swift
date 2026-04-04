@@ -36,8 +36,31 @@ private struct AppSettingsProfile: Codable, Equatable {
     )
 }
 
+/// Profile mode for multi-display configurations
+enum ProfileMode: String, Codable, CaseIterable {
+    case inherit      // Use base (single-display) profile settings
+    case independent  // Fully independent settings per configuration
+}
+
+private struct ProfileMetadata: Codable {
+    var mode: ProfileMode
+    var baseProfileID: String
+}
+
 private struct AppSettingsStore: Codable {
     var profiles: [String: AppSettingsProfile]
+    var profileMetadata: [String: ProfileMetadata]
+
+    init(profiles: [String: AppSettingsProfile], profileMetadata: [String: ProfileMetadata] = [:]) {
+        self.profiles = profiles
+        self.profileMetadata = profileMetadata
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        profiles = try container.decode([String: AppSettingsProfile].self, forKey: .profiles)
+        profileMetadata = try container.decodeIfPresent([String: ProfileMetadata].self, forKey: .profileMetadata) ?? [:]
+    }
 }
 
 /// Application-wide settings
@@ -116,16 +139,39 @@ final class AppSettings: ObservableObject {
     /// The active screen configuration that owns the current profile.
     @Published private(set) var currentConfiguration: DisplayConfiguration
 
+    /// The profile mode for the current display configuration
+    @Published private(set) var profileMode: ProfileMode = .independent
+
     var currentProfileSummary: String {
         currentConfiguration.summary
+    }
+
+    /// Whether the current configuration is multi-display
+    var isMultiDisplay: Bool {
+        currentConfiguration.isMultiDisplay
     }
 
     // MARK: - Initialization
 
     private let defaults = UserDefaults.standard
     private var profiles: [String: AppSettingsProfile] = [:]
+    private var profileMetadata: [String: ProfileMetadata] = [:]
     private var activeProfileID: String
     private var isApplyingProfile = false
+
+    /// The profile ID to actually read/write settings from.
+    /// In inherit mode, this returns the base profile ID.
+    private var effectiveProfileID: String {
+        if let meta = profileMetadata[activeProfileID], meta.mode == .inherit {
+            return meta.baseProfileID
+        }
+        return activeProfileID
+    }
+
+    /// The base profile ID for the current configuration (if in inherit mode).
+    var baseProfileID: String? {
+        profileMetadata[activeProfileID]?.baseProfileID
+    }
 
     private enum Keys {
         static let profiles = "appSettings.profiles"
@@ -146,25 +192,52 @@ final class AppSettings: ObservableObject {
     private init() {
         let configuration = DisplayConfiguration.current()
         let legacyProfile = Self.loadLegacyProfile(from: defaults)
-        let storedProfiles = Self.loadStoredProfiles(from: defaults)
+        let stored = Self.loadStore(from: defaults)
+        let storedProfiles = stored.profiles
         let initialProfile = storedProfiles[configuration.id] ?? legacyProfile
 
         self.currentConfiguration = configuration
         self.activeProfileID = configuration.id
         self.profiles = storedProfiles.isEmpty ? [configuration.id: initialProfile] : storedProfiles
         self.profiles[configuration.id] = initialProfile
-        self.fontSize = CGFloat(initialProfile.fontSize)
-        self.displayDuration = initialProfile.displayDuration
-        self.displayDelay = initialProfile.displayDelay
-        self.showSpaceIndex = initialProfile.showSpaceIndex
-        self.positionX = initialProfile.positionX
-        self.positionY = initialProfile.positionY
-        self.useUnifiedColors = initialProfile.useUnifiedColors
-        self.backgroundColor = initialProfile.backgroundColor.color
-        self.textColor = initialProfile.textColor.color
-        self.fontName = initialProfile.fontName
+        self.profileMetadata = stored.profileMetadata
+
+        // Resolve profile mode
+        if let meta = profileMetadata[configuration.id] {
+            self.profileMode = meta.mode
+        } else if configuration.isMultiDisplay {
+            // New multi-display config defaults to inherit if a base profile exists
+            if let baseID = Self.resolveBaseProfileID(for: configuration, in: profiles) {
+                let meta = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
+                self.profileMetadata[configuration.id] = meta
+                self.profileMode = .inherit
+            } else {
+                self.profileMode = .independent
+            }
+        } else {
+            self.profileMode = .independent
+        }
+
+        // Compute effective profile ID locally (can't use computed property before init completes)
+        let resolvedEffectiveID: String
+        if let meta = self.profileMetadata[configuration.id], meta.mode == .inherit {
+            resolvedEffectiveID = meta.baseProfileID
+        } else {
+            resolvedEffectiveID = configuration.id
+        }
+        let effectiveProfile = profiles[resolvedEffectiveID] ?? initialProfile
+        self.fontSize = CGFloat(effectiveProfile.fontSize)
+        self.displayDuration = effectiveProfile.displayDuration
+        self.displayDelay = effectiveProfile.displayDelay
+        self.showSpaceIndex = effectiveProfile.showSpaceIndex
+        self.positionX = effectiveProfile.positionX
+        self.positionY = effectiveProfile.positionY
+        self.useUnifiedColors = effectiveProfile.useUnifiedColors
+        self.backgroundColor = effectiveProfile.backgroundColor.color
+        self.textColor = effectiveProfile.textColor.color
+        self.fontName = effectiveProfile.fontName
         self.launchAtLogin = defaults.object(forKey: Keys.launchAtLogin) as? Bool ?? false
-        self.showForFullscreen = initialProfile.showForFullscreen
+        self.showForFullscreen = effectiveProfile.showForFullscreen
 
         persistProfiles()
     }
@@ -172,32 +245,96 @@ final class AppSettings: ObservableObject {
     func applyDisplayConfiguration(_ configuration: DisplayConfiguration) {
         guard configuration != currentConfiguration else { return }
 
-        profiles[activeProfileID] = makeActiveProfile()
+        // Save current settings to the effective profile
+        profiles[effectiveProfileID] = makeActiveProfile()
         currentConfiguration = configuration
         activeProfileID = configuration.id
 
-        if profiles[configuration.id] == nil {
+        // Resolve profile mode for the new configuration
+        if let meta = profileMetadata[configuration.id] {
+            profileMode = meta.mode
+            DebugLog.log("AppSettings", "existing metadata found", details: [
+                "mode": meta.mode.rawValue,
+                "baseProfileID": DebugLog.shortDisplayID(meta.baseProfileID)
+            ])
+        } else if configuration.isMultiDisplay {
+            let profileKeys = profiles.keys.map { DebugLog.shortDisplayID($0) }.joined(separator: ", ")
+            DebugLog.log("AppSettings", "resolving base profile for new multi-display config", details: [
+                "displayIDs": configuration.displays.map { DebugLog.shortDisplayID($0.id) }.joined(separator: ", "),
+                "builtInID": configuration.builtInDisplayID.map { DebugLog.shortDisplayID($0) } ?? "none",
+                "existingProfiles": profileKeys
+            ])
+            if let baseID = Self.resolveBaseProfileID(for: configuration, in: profiles) {
+                profileMetadata[configuration.id] = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
+                profileMode = .inherit
+                DebugLog.log("AppSettings", "inherit mode: base profile found", details: [
+                    "baseProfileID": DebugLog.shortDisplayID(baseID)
+                ])
+            } else {
+                profileMode = .independent
+                DebugLog.log("AppSettings", "independent mode: no base profile found")
+            }
+        } else {
+            profileMode = .independent
+        }
+
+        // In independent mode, create a new profile if needed
+        if profileMode == .independent && profiles[configuration.id] == nil {
             profiles[configuration.id] = makeActiveProfile()
         }
 
-        if let profile = profiles[configuration.id] {
+        if let profile = profiles[effectiveProfileID] {
             applyProfile(profile)
         }
 
         persistProfiles()
-        print("[AppSettings] Applied profile for configuration: \(configuration.summary)")
+        DebugLog.log(
+            "AppSettings",
+            "applied profile for configuration",
+            details: [
+                "summary": configuration.summary,
+                "mode": profileMode.rawValue,
+                "effectiveProfileID": DebugLog.shortDisplayID(effectiveProfileID)
+            ]
+        )
     }
 
     func resetCurrentProfileToDefaults() {
         let profile = AppSettingsProfile.default
-        profiles[activeProfileID] = profile
+        profiles[effectiveProfileID] = profile
         applyProfile(profile)
+        persistProfiles()
+    }
+
+    /// Switch the profile mode for the current multi-display configuration.
+    func setProfileMode(_ mode: ProfileMode) {
+        guard currentConfiguration.isMultiDisplay, mode != profileMode else { return }
+
+        if mode == .independent {
+            // Copy effective (base) settings into an independent profile for this config
+            profiles[activeProfileID] = makeActiveProfile()
+            if let meta = profileMetadata[activeProfileID] {
+                profileMetadata[activeProfileID] = ProfileMetadata(mode: .independent, baseProfileID: meta.baseProfileID)
+            }
+        } else {
+            // Switch to inherit: remove independent profile, fall back to base
+            if let baseID = profileMetadata[activeProfileID]?.baseProfileID
+                ?? Self.resolveBaseProfileID(for: currentConfiguration, in: profiles) {
+                profileMetadata[activeProfileID] = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
+                profiles.removeValue(forKey: activeProfileID)
+                if let baseProfile = profiles[baseID] {
+                    applyProfile(baseProfile)
+                }
+            }
+        }
+
+        profileMode = mode
         persistProfiles()
     }
 
     private func saveActiveProfile() {
         guard !isApplyingProfile else { return }
-        profiles[activeProfileID] = makeActiveProfile()
+        profiles[effectiveProfileID] = makeActiveProfile()
         persistProfiles()
     }
 
@@ -206,7 +343,8 @@ final class AppSettings: ObservableObject {
     }
 
     private func persistProfiles() {
-        guard let data = try? JSONEncoder().encode(AppSettingsStore(profiles: profiles)) else {
+        let store = AppSettingsStore(profiles: profiles, profileMetadata: profileMetadata)
+        guard let data = try? JSONEncoder().encode(store) else {
             return
         }
         defaults.set(data, forKey: Keys.profiles)
@@ -245,12 +383,33 @@ final class AppSettings: ObservableObject {
         isApplyingProfile = false
     }
 
-    private static func loadStoredProfiles(from defaults: UserDefaults) -> [String: AppSettingsProfile] {
+    private static func loadStore(from defaults: UserDefaults) -> AppSettingsStore {
         guard let data = defaults.data(forKey: Keys.profiles),
               let decoded = try? JSONDecoder().decode(AppSettingsStore.self, from: data) else {
-            return [:]
+            return AppSettingsStore(profiles: [:])
         }
-        return decoded.profiles
+        return decoded
+    }
+
+    /// Find the base (single-display) profile ID for a multi-display configuration.
+    /// Looks for a stored profile whose key is a single UUID matching one of the config's displays.
+    /// Prefers the built-in display.
+    private static func resolveBaseProfileID(for configuration: DisplayConfiguration, in profiles: [String: AppSettingsProfile]) -> String? {
+        let displayIDs = configuration.displays.map(\.id)
+
+        // Prefer built-in display
+        if let builtInID = configuration.builtInDisplayID, profiles[builtInID] != nil {
+            return builtInID
+        }
+
+        // Fall back to any single-display profile matching one of the displays
+        for displayID in displayIDs {
+            if profiles[displayID] != nil {
+                return displayID
+            }
+        }
+
+        return nil
     }
 
     private static func loadColor(from defaults: UserDefaults, forKey key: String) -> Color? {
