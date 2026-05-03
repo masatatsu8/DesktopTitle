@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import ServiceManagement
 import SwiftUI
 
 private struct AppSettingsProfile: Codable, Equatable {
@@ -45,6 +46,23 @@ enum ProfileMode: String, Codable, CaseIterable {
 private struct ProfileMetadata: Codable {
     var mode: ProfileMode
     var baseProfileID: String
+    /// Whether the user explicitly chose this mode via Settings UI.
+    /// When false, the mode is auto-resolved and can be overridden
+    /// when a base profile becomes available.
+    var isUserChosen: Bool
+
+    init(mode: ProfileMode, baseProfileID: String, isUserChosen: Bool = false) {
+        self.mode = mode
+        self.baseProfileID = baseProfileID
+        self.isUserChosen = isUserChosen
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try container.decode(ProfileMode.self, forKey: .mode)
+        baseProfileID = try container.decode(String.self, forKey: .baseProfileID)
+        isUserChosen = try container.decodeIfPresent(Bool.self, forKey: .isUserChosen) ?? false
+    }
 }
 
 private struct AppSettingsStore: Codable {
@@ -128,7 +146,7 @@ final class AppSettings: ObservableObject {
 
     /// Whether to launch at login
     @Published var launchAtLogin: Bool {
-        didSet { saveGlobalSettings() }
+        didSet { updateLaunchAtLoginRegistration() }
     }
 
     /// Whether to show overlay for fullscreen spaces
@@ -158,6 +176,7 @@ final class AppSettings: ObservableObject {
     private var profileMetadata: [String: ProfileMetadata] = [:]
     private var activeProfileID: String
     private var isApplyingProfile = false
+    private var isApplyingLaunchAtLogin = false
 
     /// The profile ID to actually read/write settings from.
     /// In inherit mode, this returns the base profile ID.
@@ -203,13 +222,14 @@ final class AppSettings: ObservableObject {
         self.profileMetadata = stored.profileMetadata
 
         // Resolve profile mode
-        if let meta = profileMetadata[configuration.id] {
-            self.profileMode = meta.mode
-        } else if configuration.isMultiDisplay {
-            // New multi-display config defaults to inherit if a base profile exists
-            if let baseID = Self.resolveBaseProfileID(for: configuration, in: profiles) {
-                let meta = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
-                self.profileMetadata[configuration.id] = meta
+        if configuration.isMultiDisplay {
+            let existingMeta = profileMetadata[configuration.id]
+            let baseID = Self.resolveBaseProfileID(for: configuration, in: profiles)
+
+            if let existingMeta, existingMeta.isUserChosen {
+                self.profileMode = existingMeta.mode
+            } else if let baseID {
+                self.profileMetadata[configuration.id] = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
                 self.profileMode = .inherit
             } else {
                 self.profileMode = .independent
@@ -236,10 +256,12 @@ final class AppSettings: ObservableObject {
         self.backgroundColor = effectiveProfile.backgroundColor.color
         self.textColor = effectiveProfile.textColor.color
         self.fontName = effectiveProfile.fontName
-        self.launchAtLogin = defaults.object(forKey: Keys.launchAtLogin) as? Bool ?? false
+        let storedLaunchAtLogin = defaults.object(forKey: Keys.launchAtLogin) as? Bool
+        self.launchAtLogin = storedLaunchAtLogin ?? Self.isLaunchAtLoginRequested
         self.showForFullscreen = effectiveProfile.showForFullscreen
 
         persistProfiles()
+        reconcileLaunchAtLoginRegistration()
     }
 
     func applyDisplayConfiguration(_ configuration: DisplayConfiguration) {
@@ -251,28 +273,28 @@ final class AppSettings: ObservableObject {
         activeProfileID = configuration.id
 
         // Resolve profile mode for the new configuration
-        if let meta = profileMetadata[configuration.id] {
-            profileMode = meta.mode
-            DebugLog.log("AppSettings", "existing metadata found", details: [
-                "mode": meta.mode.rawValue,
-                "baseProfileID": DebugLog.shortDisplayID(meta.baseProfileID)
-            ])
-        } else if configuration.isMultiDisplay {
-            let profileKeys = profiles.keys.map { DebugLog.shortDisplayID($0) }.joined(separator: ", ")
-            DebugLog.log("AppSettings", "resolving base profile for new multi-display config", details: [
+        if configuration.isMultiDisplay {
+            let existingMeta = profileMetadata[configuration.id]
+            let baseID = Self.resolveBaseProfileID(for: configuration, in: profiles)
+
+            DebugLog.log("AppSettings", "resolving profile mode for multi-display config", details: [
                 "displayIDs": configuration.displays.map { DebugLog.shortDisplayID($0.id) }.joined(separator: ", "),
                 "builtInID": configuration.builtInDisplayID.map { DebugLog.shortDisplayID($0) } ?? "none",
-                "existingProfiles": profileKeys
+                "existingMeta": existingMeta.map { "\($0.mode.rawValue), userChosen=\($0.isUserChosen)" } ?? "none",
+                "resolvedBaseID": baseID.map { DebugLog.shortDisplayID($0) } ?? "none",
+                "existingProfiles": profiles.keys.map { DebugLog.shortDisplayID($0) }.joined(separator: ", ")
             ])
-            if let baseID = Self.resolveBaseProfileID(for: configuration, in: profiles) {
+
+            if let existingMeta, existingMeta.isUserChosen {
+                // User explicitly chose this mode via Settings — respect it
+                profileMode = existingMeta.mode
+            } else if let baseID {
+                // Base profile exists — default to inherit (auto-resolve)
                 profileMetadata[configuration.id] = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
                 profileMode = .inherit
-                DebugLog.log("AppSettings", "inherit mode: base profile found", details: [
-                    "baseProfileID": DebugLog.shortDisplayID(baseID)
-                ])
             } else {
+                // No base profile available — fall back to independent
                 profileMode = .independent
-                DebugLog.log("AppSettings", "independent mode: no base profile found")
             }
         } else {
             profileMode = .independent
@@ -313,14 +335,13 @@ final class AppSettings: ObservableObject {
         if mode == .independent {
             // Copy effective (base) settings into an independent profile for this config
             profiles[activeProfileID] = makeActiveProfile()
-            if let meta = profileMetadata[activeProfileID] {
-                profileMetadata[activeProfileID] = ProfileMetadata(mode: .independent, baseProfileID: meta.baseProfileID)
-            }
+            let baseID = profileMetadata[activeProfileID]?.baseProfileID ?? ""
+            profileMetadata[activeProfileID] = ProfileMetadata(mode: .independent, baseProfileID: baseID, isUserChosen: true)
         } else {
             // Switch to inherit: remove independent profile, fall back to base
             if let baseID = profileMetadata[activeProfileID]?.baseProfileID
                 ?? Self.resolveBaseProfileID(for: currentConfiguration, in: profiles) {
-                profileMetadata[activeProfileID] = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
+                profileMetadata[activeProfileID] = ProfileMetadata(mode: .inherit, baseProfileID: baseID, isUserChosen: true)
                 profiles.removeValue(forKey: activeProfileID)
                 if let baseProfile = profiles[baseID] {
                     applyProfile(baseProfile)
@@ -340,6 +361,84 @@ final class AppSettings: ObservableObject {
 
     private func saveGlobalSettings() {
         defaults.set(launchAtLogin, forKey: Keys.launchAtLogin)
+    }
+
+    private func updateLaunchAtLoginRegistration() {
+        guard !isApplyingLaunchAtLogin else { return }
+
+        do {
+            try Self.setLaunchAtLoginRegistration(enabled: launchAtLogin)
+            saveGlobalSettings()
+        } catch {
+            DebugLog.log("AppSettings", "failed to update launch-at-login registration", details: [
+                "requested": "\(launchAtLogin)",
+                "status": Self.launchAtLoginStatusDescription,
+                "error": error.localizedDescription
+            ])
+
+            isApplyingLaunchAtLogin = true
+            launchAtLogin = Self.isLaunchAtLoginRequested
+            isApplyingLaunchAtLogin = false
+            saveGlobalSettings()
+        }
+    }
+
+    private func reconcileLaunchAtLoginRegistration() {
+        do {
+            try Self.setLaunchAtLoginRegistration(enabled: launchAtLogin)
+            saveGlobalSettings()
+        } catch {
+            DebugLog.log("AppSettings", "failed to reconcile launch-at-login registration", details: [
+                "requested": "\(launchAtLogin)",
+                "status": Self.launchAtLoginStatusDescription,
+                "error": error.localizedDescription
+            ])
+
+            isApplyingLaunchAtLogin = true
+            launchAtLogin = Self.isLaunchAtLoginRequested
+            isApplyingLaunchAtLogin = false
+            saveGlobalSettings()
+        }
+    }
+
+    private static func setLaunchAtLoginRegistration(enabled: Bool) throws {
+        let service = SMAppService.mainApp
+
+        switch (enabled, service.status) {
+        case (true, .enabled), (true, .requiresApproval),
+             (false, .notRegistered), (false, .notFound):
+            return
+        case (true, _):
+            try service.register()
+        case (false, _):
+            try service.unregister()
+        }
+    }
+
+    private static var isLaunchAtLoginRequested: Bool {
+        switch SMAppService.mainApp.status {
+        case .enabled, .requiresApproval:
+            return true
+        case .notRegistered, .notFound:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    private static var launchAtLoginStatusDescription: String {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            return "enabled"
+        case .requiresApproval:
+            return "requiresApproval"
+        case .notRegistered:
+            return "notRegistered"
+        case .notFound:
+            return "notFound"
+        @unknown default:
+            return "unknown"
+        }
     }
 
     private func persistProfiles() {

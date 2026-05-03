@@ -290,7 +290,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spaceConfigManager.setActiveProfile(
             configuration.id,
             mode: settings.profileMode,
-            baseProfileID: settings.baseProfileID
+            baseProfileID: settings.baseProfileID,
+            displayIDs: configuration.orderedDisplayIDs
         )
 
         let activeDisplayIDs = Set(configuration.orderedDisplayIDs)

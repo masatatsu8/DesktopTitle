@@ -401,7 +401,8 @@ struct SettingsView: View {
                 spaceConfigManager.setActiveProfile(
                     settings.currentConfiguration.id,
                     mode: settings.profileMode,
-                    baseProfileID: settings.baseProfileID
+                    baseProfileID: settings.baseProfileID,
+                    displayIDs: settings.currentConfiguration.orderedDisplayIDs
                 )
                 refreshSpaces()
             }
@@ -489,8 +490,8 @@ struct SettingsView: View {
             spaceNames[space.id] = ""
             spaceBackgroundColors[space.id] = nil
             spaceTextColors[space.id] = nil
-            spaceConfigManager.setName("", for: space.id, displayIndex: space.index)
-            spaceConfigManager.setColors(backgroundColor: nil, textColor: nil, for: space.id, displayIndex: space.index)
+            spaceConfigManager.setName("", for: space.id, displayIndex: space.index, displayID: space.displayID)
+            spaceConfigManager.setColors(backgroundColor: nil, textColor: nil, for: space.id, displayIndex: space.index, displayID: space.displayID)
         }
     }
 }
