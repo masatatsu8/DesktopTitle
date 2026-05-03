@@ -11,6 +11,8 @@ import SwiftUI
 
 enum DebugLog {
     private static let queue = DispatchQueue(label: "DesktopTitle.DebugLog")
+    private static let maxLogFileSizeBytes: UInt64 = 2 * 1024 * 1024
+    private static let rotatedLogFileName = "debug.log.1"
     private static let formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -34,6 +36,16 @@ enum DebugLog {
         return logFileURL
     }()
 
+    private static let rotatedLogFileURL = logFileURL.deletingLastPathComponent().appendingPathComponent(rotatedLogFileName)
+
+    static var diskLoggingEnabled: Bool {
+        #if DEBUG
+        true
+        #else
+        UserDefaults.standard.bool(forKey: "debugLoggingEnabled")
+        #endif
+    }
+
     static var filePath: String {
         logFileURL.path
     }
@@ -43,7 +55,8 @@ enum DebugLog {
             "App",
             "debug session started",
             details: [
-                "logFile": filePath,
+                "diskLoggingEnabled": "\(diskLoggingEnabled)",
+                "logFile": diskLoggingEnabled ? filePath : "disabled",
                 "pid": "\(ProcessInfo.processInfo.processIdentifier)",
                 "appKitVersion": ProcessInfo.processInfo.operatingSystemVersionString
             ]
@@ -72,9 +85,12 @@ enum DebugLog {
 
         print(entry)
 
+        guard diskLoggingEnabled else { return }
+
         queue.async {
             guard let data = "\(entry)\n".data(using: .utf8) else { return }
             do {
+                try rotateLogFileIfNeeded(incomingByteCount: UInt64(data.count))
                 let handle = try FileHandle(forWritingTo: logFileURL)
                 defer { try? handle.close() }
                 try handle.seekToEnd()
@@ -83,6 +99,25 @@ enum DebugLog {
                 print("\(timestamp) [\(threadLabel)] [DebugLog] failed to write log file: \(error)")
             }
         }
+    }
+
+    private static func rotateLogFileIfNeeded(incomingByteCount: UInt64) throws {
+        let fileManager = FileManager.default
+
+        if !fileManager.fileExists(atPath: logFileURL.path) {
+            _ = fileManager.createFile(atPath: logFileURL.path, contents: nil)
+            return
+        }
+
+        let attributes = try fileManager.attributesOfItem(atPath: logFileURL.path)
+        let currentSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        guard currentSize + incomingByteCount > maxLogFileSizeBytes else { return }
+
+        if fileManager.fileExists(atPath: rotatedLogFileURL.path) {
+            try fileManager.removeItem(at: rotatedLogFileURL)
+        }
+        try fileManager.moveItem(at: logFileURL, to: rotatedLogFileURL)
+        _ = fileManager.createFile(atPath: logFileURL.path, contents: nil)
     }
 
     static func describe(space: SpaceInfo?) -> String {

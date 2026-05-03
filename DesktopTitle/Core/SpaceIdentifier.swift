@@ -30,6 +30,8 @@ final class SpaceIdentifier {
 
     static let shared = SpaceIdentifier()
 
+    private var previousCurrentSpacesByDisplay: [String: SpaceInfo] = [:]
+
     private init() {}
 
     private func extractUInt64(from value: Any?) -> UInt64? {
@@ -62,15 +64,28 @@ final class SpaceIdentifier {
     func getCurrentSpacesByDisplay() -> [String: SpaceInfo] {
         let activeSpaceID = getActiveSpaceID()
         var currentSpaces: [String: SpaceInfo] = [:]
-        var usedFallback = false
+        var fallbackDescriptions: [String] = []
 
         for displaySpace in managedDisplaySpaces() {
             if let currentSpace = displaySpace.currentSpace {
                 currentSpaces[displaySpace.displayID] = currentSpace
             } else if let fallback = displaySpace.spaces.first(where: { $0.id == activeSpaceID }) {
                 currentSpaces[displaySpace.displayID] = fallback
-                usedFallback = true
+                fallbackDescriptions.append("\(DebugLog.shortDisplayID(displaySpace.displayID)):active")
+            } else if let previous = previousCurrentSpacesByDisplay[displaySpace.displayID],
+                      displaySpace.spaces.contains(where: { $0.id == previous.id }) {
+                currentSpaces[displaySpace.displayID] = previous
+                fallbackDescriptions.append("\(DebugLog.shortDisplayID(displaySpace.displayID)):previous")
+            } else if let firstSpace = displaySpace.spaces.first {
+                currentSpaces[displaySpace.displayID] = firstSpace
+                fallbackDescriptions.append("\(DebugLog.shortDisplayID(displaySpace.displayID)):first")
+            } else {
+                fallbackDescriptions.append("\(DebugLog.shortDisplayID(displaySpace.displayID)):unresolved")
             }
+        }
+
+        if !currentSpaces.isEmpty {
+            previousCurrentSpacesByDisplay = currentSpaces
         }
 
         DebugLog.log(
@@ -78,7 +93,7 @@ final class SpaceIdentifier {
             "resolved current spaces by display",
             details: [
                 "activeSpaceID": "\(activeSpaceID)",
-                "usedFallback": "\(usedFallback)",
+                "fallbacks": fallbackDescriptions.isEmpty ? "none" : fallbackDescriptions.joined(separator: ", "),
                 "currentSpaces": DebugLog.describe(spacesByDisplay: currentSpaces)
             ]
         )

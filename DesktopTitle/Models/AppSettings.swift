@@ -332,11 +332,14 @@ final class AppSettings: ObservableObject {
     func setProfileMode(_ mode: ProfileMode) {
         guard currentConfiguration.isMultiDisplay, mode != profileMode else { return }
 
+        let previousMode = profileMode
+
         if mode == .independent {
             // Copy effective (base) settings into an independent profile for this config
             profiles[activeProfileID] = makeActiveProfile()
             let baseID = profileMetadata[activeProfileID]?.baseProfileID ?? ""
             profileMetadata[activeProfileID] = ProfileMetadata(mode: .independent, baseProfileID: baseID, isUserChosen: true)
+            profileMode = .independent
         } else {
             // Switch to inherit: remove independent profile, fall back to base
             if let baseID = profileMetadata[activeProfileID]?.baseProfileID
@@ -346,10 +349,20 @@ final class AppSettings: ObservableObject {
                 if let baseProfile = profiles[baseID] {
                     applyProfile(baseProfile)
                 }
+                profileMode = .inherit
+            } else {
+                profileMode = previousMode
+                DebugLog.log(
+                    "AppSettings",
+                    "inherit profile mode request ignored because no base profile was available",
+                    details: [
+                        "activeProfileID": DebugLog.shortDisplayID(activeProfileID),
+                        "configuration": currentConfiguration.summary
+                    ]
+                )
             }
         }
 
-        profileMode = mode
         persistProfiles()
     }
 

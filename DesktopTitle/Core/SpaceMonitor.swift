@@ -212,6 +212,20 @@ final class SpaceMonitor: ObservableObject {
         )
 
         let newSpaces = spaceIdentifier.getCurrentSpacesByDisplay()
+        guard sequence == resolutionSequence else {
+            DebugLog.log(
+                "SpaceMonitor",
+                "discarding stale resolution result",
+                details: [
+                    "trigger": trigger,
+                    "sequence": "\(sequence)",
+                    "currentSequence": "\(resolutionSequence)",
+                    "attempt": "\(attempt)"
+                ]
+            )
+            return
+        }
+
         guard !newSpaces.isEmpty else {
             if attempt < maxResolutionAttempts {
                 let workItem = DispatchWorkItem { [weak self] in
@@ -260,10 +274,37 @@ final class SpaceMonitor: ObservableObject {
         )
 
         if Thread.isMainThread {
+            guard sequence == resolutionSequence else {
+                DebugLog.log(
+                    "SpaceMonitor",
+                    "discarding stale resolution before apply",
+                    details: [
+                        "trigger": trigger,
+                        "sequence": "\(sequence)",
+                        "currentSequence": "\(resolutionSequence)",
+                        "attempt": "\(attempt)"
+                    ]
+                )
+                return
+            }
             applyResolvedSpaces(newSpaces, trigger: trigger)
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.applyResolvedSpaces(newSpaces, trigger: trigger)
+                guard let self else { return }
+                guard sequence == self.resolutionSequence else {
+                    DebugLog.log(
+                        "SpaceMonitor",
+                        "discarding stale resolution before async apply",
+                        details: [
+                            "trigger": trigger,
+                            "sequence": "\(sequence)",
+                            "currentSequence": "\(self.resolutionSequence)",
+                            "attempt": "\(attempt)"
+                        ]
+                    )
+                    return
+                }
+                self.applyResolvedSpaces(newSpaces, trigger: trigger)
             }
         }
     }
