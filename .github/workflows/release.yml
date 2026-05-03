@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build Release
+        run: |
+          xcodebuild \
+            -project DesktopTitle.xcodeproj \
+            -scheme DesktopTitle \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/DesktopTitleDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package .app into zip
+        run: |
+          cd "$RUNNER_TEMP/DesktopTitleDerivedData/Build/Products/Release"
+          ditto -c -k --sequesterRsrc --keepParent \
+            DesktopTitle.app \
+            "$GITHUB_WORKSPACE/DesktopTitle-${GITHUB_REF_NAME}.zip"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@b25b93d384199fc0fc8c2e126b2d937a0cbeb2ae # v2.5.2
+        with:
+          files: DesktopTitle-${{ github.ref_name }}.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
