@@ -227,7 +227,8 @@ final class SpaceConfigManager: ObservableObject {
     /// Clear all configs
     func clearAll() {
         configs.removeAll()
-        saveConfigs()
+        configsByProfile.removeAll()
+        persistConfigs()
     }
 
     /// Sync configurations with current spaces (remove stale, add new)

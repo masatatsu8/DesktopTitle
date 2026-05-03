@@ -552,12 +552,6 @@ final class AppSettings: ObservableObject {
         )
     }
 
-    /// Reset all settings to defaults
-    func resetToDefaults() {
-        resetCurrentProfileToDefaults()
-        launchAtLogin = false
-    }
-
     // MARK: - Available Fonts
 
     static var availableFonts: [String] {

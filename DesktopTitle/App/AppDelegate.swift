@@ -49,10 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spaceMonitor.$currentSpace
             .receive(on: RunLoop.main)
             .sink { [weak self] space in
-                guard let self = self else { return }
-                // Keep desktop indices fresh even when macOS auto-reorders Spaces.
-                self.spaceConfigManager.syncWithCurrentSpaces()
-                self.menuBarController?.updateCurrentSpace(space)
+                self?.menuBarController?.updateCurrentSpace(space)
             }
             .store(in: &cancellables)
 
