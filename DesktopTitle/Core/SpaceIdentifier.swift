@@ -7,6 +7,12 @@
 
 import Foundation
 
+private struct ManagedDisplaySpace {
+    let displayID: String
+    let spaces: [SpaceInfo]
+    let currentSpace: SpaceInfo?
+}
+
 /// Represents information about a single Space
 struct SpaceInfo: Identifiable, Equatable {
     let id: UInt64          // CGSSpaceID
@@ -24,7 +30,24 @@ final class SpaceIdentifier {
 
     static let shared = SpaceIdentifier()
 
+    private var previousCurrentSpacesByDisplay: [String: SpaceInfo] = [:]
+
     private init() {}
+
+    private func extractUInt64(from value: Any?) -> UInt64? {
+        switch value {
+        case let v as UInt64:
+            return v
+        case let v as Int64:
+            return UInt64(bitPattern: v)
+        case let v as Int:
+            return UInt64(v)
+        case let v as NSNumber:
+            return v.uint64Value
+        default:
+            return nil
+        }
+    }
 
     /// Get the current active Space ID
     func getActiveSpaceID() -> UInt64 {
@@ -34,93 +57,162 @@ final class SpaceIdentifier {
 
     /// Get all spaces organized by display
     func getAllSpaces() -> [SpaceInfo] {
+        managedDisplaySpaces().flatMap(\.spaces)
+    }
+
+    /// Get the currently active space for each display.
+    func getCurrentSpacesByDisplay() -> [String: SpaceInfo] {
+        let activeSpaceID = getActiveSpaceID()
+        var currentSpaces: [String: SpaceInfo] = [:]
+        var fallbackDescriptions: [String] = []
+
+        for displaySpace in managedDisplaySpaces() {
+            if let currentSpace = displaySpace.currentSpace {
+                currentSpaces[displaySpace.displayID] = currentSpace
+            } else if let fallback = displaySpace.spaces.first(where: { $0.id == activeSpaceID }) {
+                currentSpaces[displaySpace.displayID] = fallback
+                fallbackDescriptions.append("\(DebugLog.shortDisplayID(displaySpace.displayID)):active")
+            } else if let previous = previousCurrentSpacesByDisplay[displaySpace.displayID],
+                      displaySpace.spaces.contains(where: { $0.id == previous.id }) {
+                currentSpaces[displaySpace.displayID] = previous
+                fallbackDescriptions.append("\(DebugLog.shortDisplayID(displaySpace.displayID)):previous")
+            } else if let firstSpace = displaySpace.spaces.first {
+                currentSpaces[displaySpace.displayID] = firstSpace
+                fallbackDescriptions.append("\(DebugLog.shortDisplayID(displaySpace.displayID)):first")
+            } else {
+                fallbackDescriptions.append("\(DebugLog.shortDisplayID(displaySpace.displayID)):unresolved")
+            }
+        }
+
+        if !currentSpaces.isEmpty {
+            previousCurrentSpacesByDisplay = currentSpaces
+        }
+
+        DebugLog.log(
+            "SpaceIdentifier",
+            "resolved current spaces by display",
+            details: [
+                "activeSpaceID": "\(activeSpaceID)",
+                "fallbacks": fallbackDescriptions.isEmpty ? "none" : fallbackDescriptions.joined(separator: ", "),
+                "currentSpaces": DebugLog.describe(spacesByDisplay: currentSpaces)
+            ]
+        )
+
+        return currentSpaces
+    }
+
+    private func managedDisplaySpaces() -> [ManagedDisplaySpace] {
         let connection = _CGSDefaultConnection()
 
         // CGSCopyManagedDisplaySpaces returns CFArrayRef (caller owns it)
         let cfArray: CFArray? = CGSCopyManagedDisplaySpaces(connection)
         guard let cfArray = cfArray else {
-            print("[SpaceIdentifier] CGSCopyManagedDisplaySpaces returned nil")
+            DebugLog.log("SpaceIdentifier", "CGSCopyManagedDisplaySpaces returned nil")
             return []
         }
 
         // Convert CFArray to Swift Array
         let nsArray = cfArray as NSArray
 
-        // Debug: Print raw data structure
-        print("[SpaceIdentifier] Raw data type: \(type(of: nsArray))")
-        print("[SpaceIdentifier] Number of displays: \(nsArray.count)")
-
         guard let displaySpaces = nsArray as? [[String: Any]] else {
-            print("[SpaceIdentifier] Failed to cast to [[String: Any]]")
-            print("[SpaceIdentifier] Actual content: \(nsArray)")
+            DebugLog.log(
+                "SpaceIdentifier",
+                "failed to cast managed display spaces payload",
+                details: [
+                    "payloadType": "\(type(of: nsArray))"
+                ]
+            )
             return []
         }
 
-        var allSpaces: [SpaceInfo] = []
+        var managedSpaces: [ManagedDisplaySpace] = []
 
         for displayInfo in displaySpaces {
-            print("[SpaceIdentifier] Display info keys: \(displayInfo.keys)")
-
             guard let displayID = displayInfo["Display Identifier"] as? String else {
-                print("[SpaceIdentifier] Missing 'Display Identifier'")
                 continue
             }
 
-            guard let spaces = displayInfo["Spaces"] as? [[String: Any]] else {
-                print("[SpaceIdentifier] Missing or invalid 'Spaces'")
-                continue
+            let spaces = (displayInfo["Spaces"] as? [[String: Any]] ?? []).enumerated().compactMap { index, spaceDict in
+                parseSpaceInfo(from: spaceDict, displayID: displayID, index: index + 1)
             }
 
-            print("[SpaceIdentifier] Found \(spaces.count) spaces for display: \(displayID)")
+            let currentSpaceDict = displayInfo["Current Space"] as? [String: Any]
+            let currentSpaceID =
+                extractUInt64(from: currentSpaceDict?["ManagedSpaceID"]) ??
+                extractUInt64(from: currentSpaceDict?["id64"]) ??
+                extractUInt64(from: currentSpaceDict?["uuid"])
+            let currentSpaceIndex = currentSpaceID.flatMap { id in
+                spaces.firstIndex(where: { $0.id == id }).map { $0 + 1 }
+            } ?? 1
 
-            for (index, spaceDict) in spaces.enumerated() {
-                print("[SpaceIdentifier] Space \(index) keys: \(spaceDict.keys)")
-                print("[SpaceIdentifier] Space \(index) data: \(spaceDict)")
-
-                // Try different possible keys for space ID
-                var spaceID: UInt64?
-                if let id = spaceDict["ManagedSpaceID"] as? UInt64 {
-                    spaceID = id
-                } else if let id = spaceDict["ManagedSpaceID"] as? Int64 {
-                    spaceID = UInt64(bitPattern: id)
-                } else if let id = spaceDict["ManagedSpaceID"] as? Int {
-                    spaceID = UInt64(id)
-                } else if let id = spaceDict["id64"] as? UInt64 {
-                    spaceID = id
-                } else if let id = spaceDict["id64"] as? Int64 {
-                    spaceID = UInt64(bitPattern: id)
-                } else if let id = spaceDict["uuid"] as? Int {
-                    spaceID = UInt64(id)
-                }
-
-                guard let finalSpaceID = spaceID else {
-                    print("[SpaceIdentifier] Could not extract space ID from: \(spaceDict)")
-                    continue
-                }
-
-                let spaceType = spaceDict["type"] as? Int ?? 0
-                let isFullscreen = spaceType == Int(kCGSSpaceFullscreen)
-
-                let spaceInfo = SpaceInfo(
-                    id: finalSpaceID,
+            let currentSpace = currentSpaceID.flatMap { id in
+                spaces.first(where: { $0.id == id })
+            } ?? currentSpaceDict.flatMap { dict in
+                parseSpaceInfo(
+                    from: dict,
                     displayID: displayID,
-                    index: index + 1,  // 1-based index
-                    isFullscreen: isFullscreen
+                    index: currentSpaceIndex
                 )
-
-                allSpaces.append(spaceInfo)
             }
+
+            managedSpaces.append(
+                ManagedDisplaySpace(
+                    displayID: displayID,
+                    spaces: spaces,
+                    currentSpace: currentSpace
+                )
+            )
         }
 
-        print("[SpaceIdentifier] Total spaces found: \(allSpaces.count)")
-        return allSpaces
+        let summary = managedSpaces
+            .map { displaySpace in
+                let currentSpace = displaySpace.currentSpace.map { "\($0.id)" } ?? "nil"
+                return "display=\(DebugLog.shortDisplayID(displaySpace.displayID)),spaces=\(displaySpace.spaces.count),currentSpaceID=\(currentSpace)"
+            }
+            .joined(separator: "; ")
+        DebugLog.log(
+            "SpaceIdentifier",
+            "parsed managed display spaces",
+            details: [
+                "displayCount": "\(managedSpaces.count)",
+                "summary": summary
+            ]
+        )
+
+        return managedSpaces
+    }
+
+    private func parseSpaceInfo(from spaceDict: [String: Any], displayID: String, index: Int) -> SpaceInfo? {
+        let spaceID =
+            extractUInt64(from: spaceDict["ManagedSpaceID"]) ??
+            extractUInt64(from: spaceDict["id64"]) ??
+            extractUInt64(from: spaceDict["uuid"])
+
+        guard let finalSpaceID = spaceID else {
+            return nil
+        }
+
+        let spaceType = spaceDict["type"] as? Int ?? 0
+        let isFullscreen = spaceType == Int(kCGSSpaceFullscreen)
+
+        return SpaceInfo(
+            id: finalSpaceID,
+            displayID: displayID,
+            index: index,
+            isFullscreen: isFullscreen
+        )
     }
 
     /// Get information about the currently active space
     func getCurrentSpaceInfo() -> SpaceInfo? {
-        let activeID = getActiveSpaceID()
-        let allSpaces = getAllSpaces()
-        return allSpaces.first { $0.id == activeID }
+        let currentSpaces = getCurrentSpacesByDisplay()
+
+        if let mainDisplayID = DisplayConfiguration.current().orderedDisplayIDs.first,
+           let mainSpace = currentSpaces[mainDisplayID] {
+            return mainSpace
+        }
+
+        return currentSpaces.values.first
     }
 
     /// Get the 1-based index of the current space on its display

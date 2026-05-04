@@ -6,7 +6,80 @@
 //
 
 import Foundation
+import ServiceManagement
 import SwiftUI
+
+private struct AppSettingsProfile: Codable, Equatable {
+    var fontSize: Double
+    var displayDuration: Double
+    var displayDelay: Double
+    var showSpaceIndex: Bool
+    var positionX: Double
+    var positionY: Double
+    var useUnifiedColors: Bool
+    var backgroundColor: CodableColor
+    var textColor: CodableColor
+    var fontName: String
+    var showForFullscreen: Bool
+
+    static let `default` = AppSettingsProfile(
+        fontSize: 48,
+        displayDuration: 1.5,
+        displayDelay: 0.0,
+        showSpaceIndex: true,
+        positionX: 0.5,
+        positionY: 0.5,
+        useUnifiedColors: true,
+        backgroundColor: CodableColor(Color.black.opacity(0.6)),
+        textColor: CodableColor(.white),
+        fontName: "",
+        showForFullscreen: true
+    )
+}
+
+/// Profile mode for multi-display configurations
+enum ProfileMode: String, Codable, CaseIterable {
+    case inherit      // Use base (single-display) profile settings
+    case independent  // Fully independent settings per configuration
+}
+
+private struct ProfileMetadata: Codable {
+    var mode: ProfileMode
+    var baseProfileID: String
+    /// Whether the user explicitly chose this mode via Settings UI.
+    /// When false, the mode is auto-resolved and can be overridden
+    /// when a base profile becomes available.
+    var isUserChosen: Bool
+
+    init(mode: ProfileMode, baseProfileID: String, isUserChosen: Bool = false) {
+        self.mode = mode
+        self.baseProfileID = baseProfileID
+        self.isUserChosen = isUserChosen
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try container.decode(ProfileMode.self, forKey: .mode)
+        baseProfileID = try container.decode(String.self, forKey: .baseProfileID)
+        isUserChosen = try container.decodeIfPresent(Bool.self, forKey: .isUserChosen) ?? false
+    }
+}
+
+private struct AppSettingsStore: Codable {
+    var profiles: [String: AppSettingsProfile]
+    var profileMetadata: [String: ProfileMetadata]
+
+    init(profiles: [String: AppSettingsProfile], profileMetadata: [String: ProfileMetadata] = [:]) {
+        self.profiles = profiles
+        self.profileMetadata = profileMetadata
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        profiles = try container.decode([String: AppSettingsProfile].self, forKey: .profiles)
+        profileMetadata = try container.decodeIfPresent([String: ProfileMetadata].self, forKey: .profileMetadata) ?? [:]
+    }
+}
 
 /// Application-wide settings
 final class AppSettings: ObservableObject {
@@ -17,133 +90,438 @@ final class AppSettings: ObservableObject {
 
     /// Font size for the overlay text
     @Published var fontSize: CGFloat {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
     /// Duration in seconds to display the overlay
     @Published var displayDuration: Double {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
     /// Delay before showing overlay (seconds)
     @Published var displayDelay: Double {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
     /// Whether to show the space index below the name
     @Published var showSpaceIndex: Bool {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
     // MARK: - Position Settings
 
     /// Horizontal position (0.0 = left, 0.5 = center, 1.0 = right)
     @Published var positionX: Double {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
     /// Vertical position (0.0 = top, 0.5 = center, 1.0 = bottom)
     @Published var positionY: Double {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
     // MARK: - Appearance Settings
 
     /// Use unified colors (true) or per-desktop colors (false)
     @Published var useUnifiedColors: Bool {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
     /// Background color (used when useUnifiedColors is true)
     @Published var backgroundColor: Color {
-        didSet { saveColor(backgroundColor, forKey: Keys.backgroundColor) }
+        didSet { saveActiveProfile() }
     }
 
     /// Text color (used when useUnifiedColors is true)
     @Published var textColor: Color {
-        didSet { saveColor(textColor, forKey: Keys.textColor) }
+        didSet { saveActiveProfile() }
     }
 
     /// Font name (empty = system default)
     @Published var fontName: String {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
     // MARK: - Behavior Settings
 
     /// Whether to launch at login
     @Published var launchAtLogin: Bool {
-        didSet { save() }
+        didSet { updateLaunchAtLoginRegistration() }
     }
 
     /// Whether to show overlay for fullscreen spaces
     @Published var showForFullscreen: Bool {
-        didSet { save() }
+        didSet { saveActiveProfile() }
     }
 
-    /// Whether to show desktop images in settings
-    @Published var showDesktopImages: Bool {
-        didSet { save() }
+    /// The active screen configuration that owns the current profile.
+    @Published private(set) var currentConfiguration: DisplayConfiguration
+
+    /// The profile mode for the current display configuration
+    @Published private(set) var profileMode: ProfileMode = .independent
+
+    var currentProfileSummary: String {
+        currentConfiguration.summary
+    }
+
+    /// Whether the current configuration is multi-display
+    var isMultiDisplay: Bool {
+        currentConfiguration.isMultiDisplay
     }
 
     // MARK: - Initialization
 
     private let defaults = UserDefaults.standard
+    private var profiles: [String: AppSettingsProfile] = [:]
+    private var profileMetadata: [String: ProfileMetadata] = [:]
+    private var activeProfileID: String
+    private var isApplyingProfile = false
+    private var isApplyingLaunchAtLogin = false
+
+    /// The profile ID to actually read/write settings from.
+    /// In inherit mode, this returns the base profile ID.
+    private var effectiveProfileID: String {
+        if let meta = profileMetadata[activeProfileID], meta.mode == .inherit {
+            return meta.baseProfileID
+        }
+        return activeProfileID
+    }
+
+    /// The base profile ID for the current configuration (if in inherit mode).
+    var baseProfileID: String? {
+        profileMetadata[activeProfileID]?.baseProfileID
+    }
 
     private enum Keys {
-        static let fontSize = "fontSize"
-        static let displayDuration = "displayDuration"
-        static let displayDelay = "displayDelay"
-        static let showSpaceIndex = "showSpaceIndex"
-        static let positionX = "positionX"
-        static let positionY = "positionY"
-        static let useUnifiedColors = "useUnifiedColors"
-        static let backgroundColor = "backgroundColor"
-        static let textColor = "textColor"
-        static let fontName = "fontName"
+        static let profiles = "appSettings.profiles"
         static let launchAtLogin = "launchAtLogin"
-        static let showForFullscreen = "showForFullscreen"
-        static let showDesktopImages = "showDesktopImages"
+        static let legacyFontSize = "fontSize"
+        static let legacyDisplayDuration = "displayDuration"
+        static let legacyDisplayDelay = "displayDelay"
+        static let legacyShowSpaceIndex = "showSpaceIndex"
+        static let legacyPositionX = "positionX"
+        static let legacyPositionY = "positionY"
+        static let legacyUseUnifiedColors = "useUnifiedColors"
+        static let legacyBackgroundColor = "backgroundColor"
+        static let legacyTextColor = "textColor"
+        static let legacyFontName = "fontName"
+        static let legacyShowForFullscreen = "showForFullscreen"
     }
 
     private init() {
-        // Load saved values or use defaults
-        self.fontSize = defaults.object(forKey: Keys.fontSize) as? CGFloat ?? 48
-        self.displayDuration = defaults.object(forKey: Keys.displayDuration) as? Double ?? 1.5
-        self.displayDelay = defaults.object(forKey: Keys.displayDelay) as? Double ?? 0.0
-        self.showSpaceIndex = defaults.object(forKey: Keys.showSpaceIndex) as? Bool ?? true
-        self.positionX = defaults.object(forKey: Keys.positionX) as? Double ?? 0.5
-        self.positionY = defaults.object(forKey: Keys.positionY) as? Double ?? 0.5
-        self.useUnifiedColors = defaults.object(forKey: Keys.useUnifiedColors) as? Bool ?? true
-        self.backgroundColor = Self.loadColor(from: defaults, forKey: Keys.backgroundColor) ?? Color.black.opacity(0.6)
-        self.textColor = Self.loadColor(from: defaults, forKey: Keys.textColor) ?? Color.white
-        self.fontName = defaults.string(forKey: Keys.fontName) ?? ""
-        self.launchAtLogin = defaults.object(forKey: Keys.launchAtLogin) as? Bool ?? false
-        self.showForFullscreen = defaults.object(forKey: Keys.showForFullscreen) as? Bool ?? true
-        self.showDesktopImages = defaults.object(forKey: Keys.showDesktopImages) as? Bool ?? false
-    }
+        let configuration = DisplayConfiguration.current()
+        let legacyProfile = Self.loadLegacyProfile(from: defaults)
+        let stored = Self.loadStore(from: defaults)
+        let storedProfiles = stored.profiles
+        let initialProfile = storedProfiles[configuration.id] ?? legacyProfile
 
-    private func save() {
-        defaults.set(fontSize, forKey: Keys.fontSize)
-        defaults.set(displayDuration, forKey: Keys.displayDuration)
-        defaults.set(displayDelay, forKey: Keys.displayDelay)
-        defaults.set(showSpaceIndex, forKey: Keys.showSpaceIndex)
-        defaults.set(positionX, forKey: Keys.positionX)
-        defaults.set(positionY, forKey: Keys.positionY)
-        defaults.set(useUnifiedColors, forKey: Keys.useUnifiedColors)
-        defaults.set(fontName, forKey: Keys.fontName)
-        defaults.set(launchAtLogin, forKey: Keys.launchAtLogin)
-        defaults.set(showForFullscreen, forKey: Keys.showForFullscreen)
-        defaults.set(showDesktopImages, forKey: Keys.showDesktopImages)
-    }
+        self.currentConfiguration = configuration
+        self.activeProfileID = configuration.id
+        self.profiles = storedProfiles.isEmpty ? [configuration.id: initialProfile] : storedProfiles
+        self.profiles[configuration.id] = initialProfile
+        self.profileMetadata = stored.profileMetadata
 
-    // MARK: - Color Persistence
+        // Resolve profile mode
+        if configuration.isMultiDisplay {
+            let existingMeta = profileMetadata[configuration.id]
+            let baseID = Self.resolveBaseProfileID(for: configuration, in: profiles)
 
-    private func saveColor(_ color: Color, forKey key: String) {
-        let nsColor = NSColor(color)
-        if let data = try? NSKeyedArchiver.archivedData(withRootObject: nsColor, requiringSecureCoding: false) {
-            defaults.set(data, forKey: key)
+            if let existingMeta, existingMeta.isUserChosen {
+                self.profileMode = existingMeta.mode
+            } else if let baseID {
+                self.profileMetadata[configuration.id] = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
+                self.profileMode = .inherit
+            } else {
+                self.profileMode = .independent
+            }
+        } else {
+            self.profileMode = .independent
         }
+
+        // Compute effective profile ID locally (can't use computed property before init completes)
+        let resolvedEffectiveID: String
+        if let meta = self.profileMetadata[configuration.id], meta.mode == .inherit {
+            resolvedEffectiveID = meta.baseProfileID
+        } else {
+            resolvedEffectiveID = configuration.id
+        }
+        let effectiveProfile = profiles[resolvedEffectiveID] ?? initialProfile
+        self.fontSize = CGFloat(effectiveProfile.fontSize)
+        self.displayDuration = effectiveProfile.displayDuration
+        self.displayDelay = effectiveProfile.displayDelay
+        self.showSpaceIndex = effectiveProfile.showSpaceIndex
+        self.positionX = effectiveProfile.positionX
+        self.positionY = effectiveProfile.positionY
+        self.useUnifiedColors = effectiveProfile.useUnifiedColors
+        self.backgroundColor = effectiveProfile.backgroundColor.color
+        self.textColor = effectiveProfile.textColor.color
+        self.fontName = effectiveProfile.fontName
+        let storedLaunchAtLogin = defaults.object(forKey: Keys.launchAtLogin) as? Bool
+        self.launchAtLogin = storedLaunchAtLogin ?? Self.isLaunchAtLoginRequested
+        self.showForFullscreen = effectiveProfile.showForFullscreen
+
+        persistProfiles()
+        reconcileLaunchAtLoginRegistration()
+    }
+
+    func applyDisplayConfiguration(_ configuration: DisplayConfiguration) {
+        guard configuration != currentConfiguration else { return }
+
+        // Save current settings to the effective profile
+        profiles[effectiveProfileID] = makeActiveProfile()
+        currentConfiguration = configuration
+        activeProfileID = configuration.id
+
+        // Resolve profile mode for the new configuration
+        if configuration.isMultiDisplay {
+            let existingMeta = profileMetadata[configuration.id]
+            let baseID = Self.resolveBaseProfileID(for: configuration, in: profiles)
+
+            DebugLog.log("AppSettings", "resolving profile mode for multi-display config", details: [
+                "displayIDs": configuration.displays.map { DebugLog.shortDisplayID($0.id) }.joined(separator: ", "),
+                "builtInID": configuration.builtInDisplayID.map { DebugLog.shortDisplayID($0) } ?? "none",
+                "existingMeta": existingMeta.map { "\($0.mode.rawValue), userChosen=\($0.isUserChosen)" } ?? "none",
+                "resolvedBaseID": baseID.map { DebugLog.shortDisplayID($0) } ?? "none",
+                "existingProfiles": profiles.keys.map { DebugLog.shortDisplayID($0) }.joined(separator: ", ")
+            ])
+
+            if let existingMeta, existingMeta.isUserChosen {
+                // User explicitly chose this mode via Settings — respect it
+                profileMode = existingMeta.mode
+            } else if let baseID {
+                // Base profile exists — default to inherit (auto-resolve)
+                profileMetadata[configuration.id] = ProfileMetadata(mode: .inherit, baseProfileID: baseID)
+                profileMode = .inherit
+            } else {
+                // No base profile available — fall back to independent
+                profileMode = .independent
+            }
+        } else {
+            profileMode = .independent
+        }
+
+        // In independent mode, create a new profile if needed
+        if profileMode == .independent && profiles[configuration.id] == nil {
+            profiles[configuration.id] = makeActiveProfile()
+        }
+
+        if let profile = profiles[effectiveProfileID] {
+            applyProfile(profile)
+        }
+
+        persistProfiles()
+        DebugLog.log(
+            "AppSettings",
+            "applied profile for configuration",
+            details: [
+                "summary": configuration.summary,
+                "mode": profileMode.rawValue,
+                "effectiveProfileID": DebugLog.shortDisplayID(effectiveProfileID)
+            ]
+        )
+    }
+
+    func resetCurrentProfileToDefaults() {
+        let profile = AppSettingsProfile.default
+        profiles[effectiveProfileID] = profile
+        applyProfile(profile)
+        persistProfiles()
+    }
+
+    /// Switch the profile mode for the current multi-display configuration.
+    func setProfileMode(_ mode: ProfileMode) {
+        guard currentConfiguration.isMultiDisplay, mode != profileMode else { return }
+
+        let previousMode = profileMode
+
+        if mode == .independent {
+            // Copy effective (base) settings into an independent profile for this config
+            profiles[activeProfileID] = makeActiveProfile()
+            let baseID = profileMetadata[activeProfileID]?.baseProfileID ?? ""
+            profileMetadata[activeProfileID] = ProfileMetadata(mode: .independent, baseProfileID: baseID, isUserChosen: true)
+            profileMode = .independent
+        } else {
+            // Switch to inherit: remove independent profile, fall back to base
+            if let baseID = profileMetadata[activeProfileID]?.baseProfileID
+                ?? Self.resolveBaseProfileID(for: currentConfiguration, in: profiles) {
+                profileMetadata[activeProfileID] = ProfileMetadata(mode: .inherit, baseProfileID: baseID, isUserChosen: true)
+                profiles.removeValue(forKey: activeProfileID)
+                if let baseProfile = profiles[baseID] {
+                    applyProfile(baseProfile)
+                }
+                profileMode = .inherit
+            } else {
+                profileMode = previousMode
+                DebugLog.log(
+                    "AppSettings",
+                    "inherit profile mode request ignored because no base profile was available",
+                    details: [
+                        "activeProfileID": DebugLog.shortDisplayID(activeProfileID),
+                        "configuration": currentConfiguration.summary
+                    ]
+                )
+            }
+        }
+
+        persistProfiles()
+    }
+
+    private func saveActiveProfile() {
+        guard !isApplyingProfile else { return }
+        profiles[effectiveProfileID] = makeActiveProfile()
+        persistProfiles()
+    }
+
+    private func saveGlobalSettings() {
+        defaults.set(launchAtLogin, forKey: Keys.launchAtLogin)
+    }
+
+    private func updateLaunchAtLoginRegistration() {
+        guard !isApplyingLaunchAtLogin else { return }
+
+        do {
+            try Self.setLaunchAtLoginRegistration(enabled: launchAtLogin)
+            saveGlobalSettings()
+        } catch {
+            DebugLog.log("AppSettings", "failed to update launch-at-login registration", details: [
+                "requested": "\(launchAtLogin)",
+                "status": Self.launchAtLoginStatusDescription,
+                "error": error.localizedDescription
+            ])
+
+            isApplyingLaunchAtLogin = true
+            launchAtLogin = Self.isLaunchAtLoginRequested
+            isApplyingLaunchAtLogin = false
+            saveGlobalSettings()
+        }
+    }
+
+    private func reconcileLaunchAtLoginRegistration() {
+        do {
+            try Self.setLaunchAtLoginRegistration(enabled: launchAtLogin)
+            saveGlobalSettings()
+        } catch {
+            DebugLog.log("AppSettings", "failed to reconcile launch-at-login registration", details: [
+                "requested": "\(launchAtLogin)",
+                "status": Self.launchAtLoginStatusDescription,
+                "error": error.localizedDescription
+            ])
+
+            isApplyingLaunchAtLogin = true
+            launchAtLogin = Self.isLaunchAtLoginRequested
+            isApplyingLaunchAtLogin = false
+            saveGlobalSettings()
+        }
+    }
+
+    private static func setLaunchAtLoginRegistration(enabled: Bool) throws {
+        let service = SMAppService.mainApp
+
+        switch (enabled, service.status) {
+        case (true, .enabled), (true, .requiresApproval),
+             (false, .notRegistered), (false, .notFound):
+            return
+        case (true, _):
+            try service.register()
+        case (false, _):
+            try service.unregister()
+        }
+    }
+
+    private static var isLaunchAtLoginRequested: Bool {
+        switch SMAppService.mainApp.status {
+        case .enabled, .requiresApproval:
+            return true
+        case .notRegistered, .notFound:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    private static var launchAtLoginStatusDescription: String {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            return "enabled"
+        case .requiresApproval:
+            return "requiresApproval"
+        case .notRegistered:
+            return "notRegistered"
+        case .notFound:
+            return "notFound"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private func persistProfiles() {
+        let store = AppSettingsStore(profiles: profiles, profileMetadata: profileMetadata)
+        guard let data = try? JSONEncoder().encode(store) else {
+            return
+        }
+        defaults.set(data, forKey: Keys.profiles)
+        saveGlobalSettings()
+    }
+
+    private func makeActiveProfile() -> AppSettingsProfile {
+        AppSettingsProfile(
+            fontSize: Double(fontSize),
+            displayDuration: displayDuration,
+            displayDelay: displayDelay,
+            showSpaceIndex: showSpaceIndex,
+            positionX: positionX,
+            positionY: positionY,
+            useUnifiedColors: useUnifiedColors,
+            backgroundColor: CodableColor(backgroundColor),
+            textColor: CodableColor(textColor),
+            fontName: fontName,
+            showForFullscreen: showForFullscreen
+        )
+    }
+
+    private func applyProfile(_ profile: AppSettingsProfile) {
+        isApplyingProfile = true
+        fontSize = CGFloat(profile.fontSize)
+        displayDuration = profile.displayDuration
+        displayDelay = profile.displayDelay
+        showSpaceIndex = profile.showSpaceIndex
+        positionX = profile.positionX
+        positionY = profile.positionY
+        useUnifiedColors = profile.useUnifiedColors
+        backgroundColor = profile.backgroundColor.color
+        textColor = profile.textColor.color
+        fontName = profile.fontName
+        showForFullscreen = profile.showForFullscreen
+        isApplyingProfile = false
+    }
+
+    private static func loadStore(from defaults: UserDefaults) -> AppSettingsStore {
+        guard let data = defaults.data(forKey: Keys.profiles),
+              let decoded = try? JSONDecoder().decode(AppSettingsStore.self, from: data) else {
+            return AppSettingsStore(profiles: [:])
+        }
+        return decoded
+    }
+
+    /// Find the base (single-display) profile ID for a multi-display configuration.
+    /// Looks for a stored profile whose key is a single UUID matching one of the config's displays.
+    /// Prefers the built-in display.
+    private static func resolveBaseProfileID(for configuration: DisplayConfiguration, in profiles: [String: AppSettingsProfile]) -> String? {
+        let displayIDs = configuration.displays.map(\.id)
+
+        // Prefer built-in display
+        if let builtInID = configuration.builtInDisplayID, profiles[builtInID] != nil {
+            return builtInID
+        }
+
+        // Fall back to any single-display profile matching one of the displays
+        for displayID in displayIDs {
+            if profiles[displayID] != nil {
+                return displayID
+            }
+        }
+
+        return nil
     }
 
     private static func loadColor(from defaults: UserDefaults, forKey key: String) -> Color? {
@@ -154,21 +532,24 @@ final class AppSettings: ObservableObject {
         return Color(nsColor)
     }
 
-    /// Reset all settings to defaults
-    func resetToDefaults() {
-        fontSize = 48
-        displayDuration = 1.5
-        displayDelay = 0.0
-        showSpaceIndex = true
-        positionX = 0.5
-        positionY = 0.5
-        useUnifiedColors = true
-        backgroundColor = Color.black.opacity(0.6)
-        textColor = Color.white
-        fontName = ""
-        launchAtLogin = false
-        showForFullscreen = true
-        showDesktopImages = false
+    private static func loadLegacyProfile(from defaults: UserDefaults) -> AppSettingsProfile {
+        AppSettingsProfile(
+            fontSize: defaults.doubleValue(forKey: Keys.legacyFontSize, default: AppSettingsProfile.default.fontSize),
+            displayDuration: defaults.doubleValue(forKey: Keys.legacyDisplayDuration, default: AppSettingsProfile.default.displayDuration),
+            displayDelay: defaults.doubleValue(forKey: Keys.legacyDisplayDelay, default: AppSettingsProfile.default.displayDelay),
+            showSpaceIndex: defaults.object(forKey: Keys.legacyShowSpaceIndex) as? Bool ?? AppSettingsProfile.default.showSpaceIndex,
+            positionX: defaults.doubleValue(forKey: Keys.legacyPositionX, default: AppSettingsProfile.default.positionX),
+            positionY: defaults.doubleValue(forKey: Keys.legacyPositionY, default: AppSettingsProfile.default.positionY),
+            useUnifiedColors: defaults.object(forKey: Keys.legacyUseUnifiedColors) as? Bool ?? AppSettingsProfile.default.useUnifiedColors,
+            backgroundColor: CodableColor(
+                loadColor(from: defaults, forKey: Keys.legacyBackgroundColor) ?? AppSettingsProfile.default.backgroundColor.color
+            ),
+            textColor: CodableColor(
+                loadColor(from: defaults, forKey: Keys.legacyTextColor) ?? AppSettingsProfile.default.textColor.color
+            ),
+            fontName: defaults.string(forKey: Keys.legacyFontName) ?? AppSettingsProfile.default.fontName,
+            showForFullscreen: defaults.object(forKey: Keys.legacyShowForFullscreen) as? Bool ?? AppSettingsProfile.default.showForFullscreen
+        )
     }
 
     // MARK: - Available Fonts
@@ -176,5 +557,14 @@ final class AppSettings: ObservableObject {
     static var availableFonts: [String] {
         let families = NSFontManager.shared.availableFontFamilies
         return [""] + families.sorted()
+    }
+}
+
+private extension UserDefaults {
+    func doubleValue(forKey key: String, default fallback: Double) -> Double {
+        guard object(forKey: key) != nil else {
+            return fallback
+        }
+        return double(forKey: key)
     }
 }

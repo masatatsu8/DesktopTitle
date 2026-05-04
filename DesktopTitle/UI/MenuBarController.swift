@@ -86,8 +86,14 @@ final class MenuBarController {
             settingsWindow = window
         }
 
-        settingsWindow?.makeKeyAndOrderFront(nil)
+        // Ensure app is activated first, then make window key
         NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+
+        // Force the window to become key after a short delay (workaround for menu bar apps)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.settingsWindow?.makeKeyAndOrderFront(nil)
+        }
     }
 
     @objc private func quitApp() {

@@ -6,11 +6,11 @@
 //
 
 import SwiftUI
+import Combine
 
 struct SettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var spaceConfigManager = SpaceConfigManager.shared
-    @ObservedObject private var imageCache = DesktopImageCache.shared
     @State private var spaces: [SpaceInfo] = []
     @State private var spaceNames: [UInt64: String] = [:]
     @State private var spaceBackgroundColors: [UInt64: Color] = [:]
@@ -39,6 +39,12 @@ struct SettingsView: View {
         .onAppear {
             refreshSpaces()
         }
+        .onReceive(SpaceMonitor.shared.$currentSpace.compactMap { $0 }) { _ in
+            refreshSpaces()
+        }
+        .onReceive(settings.$currentConfiguration) { _ in
+            refreshSpaces()
+        }
     }
 
     // MARK: - Spaces Tab
@@ -51,40 +57,9 @@ struct SettingsView: View {
 
                 Spacer()
 
-                Toggle("Show Desktop Images", isOn: $settings.showDesktopImages)
-                    .toggleStyle(.switch)
-            }
-
-            // Permission warning
-            if settings.showDesktopImages && !imageCache.hasPermission {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                        Text("Screen recording permission required")
-                            .font(.caption)
-                        Spacer()
-                        Button("Re-check") {
-                            imageCache.checkPermission()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        Button("Open Settings") {
-                            imageCache.requestPermission()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-                    Text("Add this app to Screen Recording:")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text(DesktopImageCache.appPath)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
-                }
-                .padding(8)
-                .background(RoundedRectangle(cornerRadius: 6).fill(.orange.opacity(0.1)))
+                Text(settings.currentProfileSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if spaces.isEmpty {
@@ -98,11 +73,26 @@ struct SettingsView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 // Highlight current desktop
-                                let isCurrent = space.id == SpaceMonitor.shared.currentSpace?.id
+                                let isCurrent = SpaceMonitor.shared.currentSpacesByDisplay.values.contains { $0.id == space.id }
 
-                                Text("Desktop \(space.index)")
-                                    .frame(width: 100, alignment: .leading)
-                                    .foregroundStyle(isCurrent ? .blue : .secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Desktop \(space.index)")
+                                        .foregroundStyle(isCurrent ? .blue : .secondary)
+                                    if NSScreen.screens.count > 1,
+                                       let screenName = NSScreen.screens.first(where: { $0.displayUUIDString == space.displayID })?.localizedName {
+                                        HStack(spacing: 4) {
+                                            Text(screenName)
+                                                .font(.caption2)
+                                                .foregroundStyle(.tertiary)
+                                            if spaceConfigManager.isInheritedSpace(space) {
+                                                Text("(shared)")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.blue)
+                                            }
+                                        }
+                                    }
+                                }
+                                .frame(width: 100, alignment: .leading)
 
                                 TextField("Enter name...", text: binding(for: space))
                                     .textFieldStyle(.roundedBorder)
@@ -140,35 +130,6 @@ struct SettingsView: View {
                                 }
                                 .padding(.leading, 100)
                             }
-
-                            // Desktop thumbnail (only show if permission granted)
-                            if settings.showDesktopImages && imageCache.hasPermission {
-                                if let image = imageCache.getImage(for: space.id) {
-                                    Image(nsImage: image)
-                                        .resizable()
-                                        .aspectRatio(contentMode: .fit)
-                                        .frame(height: 80)
-                                        .cornerRadius(6)
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .stroke(.gray.opacity(0.3), lineWidth: 1)
-                                        )
-                                } else {
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .fill(.gray.opacity(0.2))
-                                        .frame(height: 80)
-                                        .overlay {
-                                            VStack(spacing: 4) {
-                                                Text("No image yet")
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
-                                                Text("Switch to this desktop to capture")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.tertiary)
-                                            }
-                                        }
-                                }
-                            }
                         }
                         .padding(.vertical, 4)
                     }
@@ -189,17 +150,6 @@ struct SettingsView: View {
             }
         }
         .padding()
-        .onChange(of: settings.showDesktopImages) { isEnabled in
-            guard isEnabled else { return }
-            imageCache.checkPermission()
-            if imageCache.hasPermission {
-                imageCache.captureNow()
-            }
-        }
-        .onChange(of: imageCache.hasPermission) { hasPermission in
-            guard settings.showDesktopImages, hasPermission else { return }
-            imageCache.captureNow()
-        }
     }
 
     // MARK: - Display Tab
@@ -207,6 +157,30 @@ struct SettingsView: View {
     private var displayTab: some View {
         ScrollView {
             Form {
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Current display profile")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(settings.currentProfileSummary)
+                    }
+
+                    if settings.isMultiDisplay {
+                        Picker("Profile Mode", selection: profileModeBinding) {
+                            Text("Inherit from built-in display").tag(ProfileMode.inherit)
+                            Text("Independent").tag(ProfileMode.independent)
+                        }
+
+                        if settings.profileMode == .inherit {
+                            Text("Display settings are shared with the built-in display profile. Changes here also apply when using the built-in display only.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Profile")
+                }
+
                 Section {
                     HStack {
                         Text("Display Delay")
@@ -314,6 +288,17 @@ struct SettingsView: View {
             .formStyle(.grouped)
         }
         .padding()
+        .onChange(of: settings.useUnifiedColors) { _, _ in
+            requestOverlayPreview()
+        }
+        .onChange(of: settings.textColor) { _, _ in
+            guard settings.useUnifiedColors else { return }
+            requestOverlayPreview()
+        }
+        .onChange(of: settings.backgroundColor) { _, _ in
+            guard settings.useUnifiedColors else { return }
+            requestOverlayPreview()
+        }
     }
 
     private func positionLabel(_ value: Double, axis: String) -> String {
@@ -342,6 +327,8 @@ struct SettingsView: View {
                             .font(previewFont(size: settings.fontSize * 0.2))
                             .foregroundStyle(settings.textColor.opacity(0.7))
                     }
+
+
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 12)
@@ -377,8 +364,12 @@ struct SettingsView: View {
             }
 
             Section {
-                Button("Reset to Defaults") {
-                    settings.resetToDefaults()
+                Text("Display settings and desktop names are stored per display configuration. Multi-display configurations can inherit settings from the built-in display profile or use independent settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Button("Reset Current Profile to Defaults") {
+                    settings.resetCurrentProfileToDefaults()
                 }
             } header: {
                 Text("Reset")
@@ -401,6 +392,23 @@ struct SettingsView: View {
 
     // MARK: - Helper Methods
 
+    private var profileModeBinding: Binding<ProfileMode> {
+        Binding(
+            get: { settings.profileMode },
+            set: { newValue in
+                settings.setProfileMode(newValue)
+                // Re-sync SpaceConfigManager with new mode
+                spaceConfigManager.setActiveProfile(
+                    settings.currentConfiguration.id,
+                    mode: settings.profileMode,
+                    baseProfileID: settings.baseProfileID,
+                    displayIDs: settings.currentConfiguration.orderedDisplayIDs
+                )
+                refreshSpaces()
+            }
+        )
+    }
+
     private func binding(for space: SpaceInfo) -> Binding<String> {
         Binding(
             get: {
@@ -408,7 +416,7 @@ struct SettingsView: View {
             },
             set: { newValue in
                 spaceNames[space.id] = newValue
-                spaceConfigManager.setName(newValue, for: space.id, displayIndex: space.index)
+                spaceConfigManager.setName(newValue, for: space.id, displayIndex: space.index, displayID: space.displayID)
             }
         )
     }
@@ -421,7 +429,8 @@ struct SettingsView: View {
             set: { newValue in
                 spaceBackgroundColors[space.id] = newValue
                 let textColor = spaceTextColors[space.id] ?? spaceConfigManager.getTextColor(for: space)
-                spaceConfigManager.setColors(backgroundColor: newValue, textColor: textColor, for: space.id, displayIndex: space.index)
+                spaceConfigManager.setColors(backgroundColor: newValue, textColor: textColor, for: space.id, displayIndex: space.index, displayID: space.displayID)
+                requestOverlayPreview(for: space)
             }
         )
     }
@@ -434,26 +443,46 @@ struct SettingsView: View {
             set: { newValue in
                 spaceTextColors[space.id] = newValue
                 let bgColor = spaceBackgroundColors[space.id] ?? spaceConfigManager.getBackgroundColor(for: space)
-                spaceConfigManager.setColors(backgroundColor: bgColor, textColor: newValue, for: space.id, displayIndex: space.index)
+                spaceConfigManager.setColors(backgroundColor: bgColor, textColor: newValue, for: space.id, displayIndex: space.index, displayID: space.displayID)
+                requestOverlayPreview(for: space)
             }
         )
+    }
+
+    private func requestOverlayPreview(for space: SpaceInfo? = nil) {
+        DebugLog.log(
+            "SettingsView",
+            "requested overlay preview from settings",
+            details: [
+                "space": DebugLog.describe(space: space)
+            ]
+        )
+        AppDelegate.shared?.showPreviewOverlay(for: space)
     }
 
     private func refreshSpaces() {
         spaces = SpaceIdentifier.shared.getAllSpaces().filter { !$0.isFullscreen }
         spaceConfigManager.syncWithCurrentSpaces()
 
-        // Load current names and colors
+        var nextSpaceNames: [UInt64: String] = [:]
+        var nextBackgroundColors: [UInt64: Color] = [:]
+        var nextTextColors: [UInt64: Color] = [:]
+
+        // Rebuild cached values for the active profile so stale colors do not leak across profiles.
         for space in spaces {
             let config = spaceConfigManager.getConfig(for: space)
-            spaceNames[space.id] = config.name
+            nextSpaceNames[space.id] = config.name
             if let bgColor = config.backgroundColor?.color {
-                spaceBackgroundColors[space.id] = bgColor
+                nextBackgroundColors[space.id] = bgColor
             }
             if let txtColor = config.textColor?.color {
-                spaceTextColors[space.id] = txtColor
+                nextTextColors[space.id] = txtColor
             }
         }
+
+        spaceNames = nextSpaceNames
+        spaceBackgroundColors = nextBackgroundColors
+        spaceTextColors = nextTextColors
     }
 
     private func clearAllNames() {
@@ -461,11 +490,9 @@ struct SettingsView: View {
             spaceNames[space.id] = ""
             spaceBackgroundColors[space.id] = nil
             spaceTextColors[space.id] = nil
-            spaceConfigManager.setName("", for: space.id, displayIndex: space.index)
-            spaceConfigManager.setColors(backgroundColor: nil, textColor: nil, for: space.id, displayIndex: space.index)
+            spaceConfigManager.setName("", for: space.id, displayIndex: space.index, displayID: space.displayID)
+            spaceConfigManager.setColors(backgroundColor: nil, textColor: nil, for: space.id, displayIndex: space.index, displayID: space.displayID)
         }
-        // Also clear cached images
-        imageCache.clearAllImages()
     }
 }
 
