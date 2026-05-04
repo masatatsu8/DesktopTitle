@@ -64,6 +64,11 @@ final class SpaceConfigManager: ObservableObject {
 
     static let shared = SpaceConfigManager()
 
+    private struct SpacePosition: Hashable {
+        let displayID: String
+        let index: Int
+    }
+
     @Published private(set) var configs: [UInt64: SpaceConfig] = [:]
 
     private let userDefaultsKey = "SpaceConfigs"
@@ -167,6 +172,8 @@ final class SpaceConfigManager: ObservableObject {
 
     /// Update the name for a space
     func setName(_ name: String, for spaceID: UInt64, displayIndex: Int, displayID: String? = nil) {
+        syncBeforeEditingIfNeeded(spaceID: spaceID, displayIndex: displayIndex, displayID: displayID)
+
         var config = configs[spaceID] ?? SpaceConfig(id: spaceID, displayIndex: displayIndex, displayID: displayID)
         config.name = name
         config.displayIndex = displayIndex
@@ -189,6 +196,8 @@ final class SpaceConfigManager: ObservableObject {
 
     /// Update colors for a space
     func setColors(backgroundColor: Color?, textColor: Color?, for spaceID: UInt64, displayIndex: Int, displayID: String? = nil) {
+        syncBeforeEditingIfNeeded(spaceID: spaceID, displayIndex: displayIndex, displayID: displayID)
+
         var config = configs[spaceID] ?? SpaceConfig(id: spaceID, displayIndex: displayIndex, displayID: displayID)
         config.backgroundColor = backgroundColor.map { CodableColor($0) }
         config.textColor = textColor.map { CodableColor($0) }
@@ -234,43 +243,10 @@ final class SpaceConfigManager: ObservableObject {
     /// Sync configurations with current spaces (remove stale, add new)
     func syncWithCurrentSpaces() {
         let currentSpaces = SpaceIdentifier.shared.getAllSpaces()
-        let currentIDs = Set(currentSpaces.map { $0.id })
+        guard !currentSpaces.isEmpty else { return }
 
-        // Update display indices and remap saved names if macOS changed CGSSpaceID
-        // after a display was attached or detached.
-        for space in currentSpaces {
-            let profileID = effectiveProfileID(for: space.displayID)
-            let reusable = configs[space.id].map { (id: Optional<UInt64>.none, config: $0) }
-                ?? reusableConfig(for: space)
-
-            var config = reusable?.config ?? SpaceConfig(
-                id: space.id,
-                name: "",
-                displayIndex: space.index,
-                displayID: space.displayID
-            )
-            config.displayIndex = space.index
-            config.displayID = space.displayID
-            configs[space.id] = config
-
-            var profileConfigs = configsByProfile[profileID] ?? [:]
-            if let oldID = reusable?.id, oldID != space.id {
-                profileConfigs.removeValue(forKey: oldID)
-            }
-            removeStaleConfigs(
-                from: &profileConfigs,
-                keeping: space.id,
-                displayIndex: space.index,
-                displayID: space.displayID
-            )
-            profileConfigs[space.id] = config
-            configsByProfile[profileID] = profileConfigs
-        }
-
-        // Remove configs for spaces that no longer exist
-        configs = configs.filter { currentIDs.contains($0.key) }
-
-        saveConfigs()
+        normalizeConfigs(with: currentSpaces)
+        persistConfigs()
     }
 
     /// Whether a space belongs to the base (inherited) profile
@@ -297,27 +273,10 @@ final class SpaceConfigManager: ObservableObject {
 
     /// Save current merged configs back to the correct underlying profiles.
     private func saveCurrentConfigs() {
-        let spacesByID = Dictionary(uniqueKeysWithValues: SpaceIdentifier.shared.getAllSpaces().map { ($0.id, $0) })
-        guard !spacesByID.isEmpty else { return }
+        let currentSpaces = SpaceIdentifier.shared.getAllSpaces()
+        guard !currentSpaces.isEmpty else { return }
 
-        for (spaceID, config) in configs {
-            guard let space = spacesByID[spaceID] else { continue }
-
-            var updatedConfig = config
-            updatedConfig.displayIndex = space.index
-            updatedConfig.displayID = space.displayID
-
-            let profileID = effectiveProfileID(for: space.displayID)
-            var profileConfigs = configsByProfile[profileID] ?? [:]
-            removeStaleConfigs(
-                from: &profileConfigs,
-                keeping: spaceID,
-                displayIndex: space.index,
-                displayID: space.displayID
-            )
-            profileConfigs[spaceID] = updatedConfig
-            configsByProfile[profileID] = profileConfigs
-        }
+        normalizeConfigs(with: currentSpaces)
     }
 
     private func removeStaleConfigs(
@@ -372,11 +331,164 @@ final class SpaceConfigManager: ObservableObject {
         persistConfigs()
     }
 
+    private func syncBeforeEditingIfNeeded(spaceID: UInt64, displayIndex: Int, displayID: String?) {
+        guard let config = configs[spaceID] else {
+            saveCurrentConfigs()
+            return
+        }
+
+        if config.displayIndex != displayIndex || config.displayID != displayID {
+            saveCurrentConfigs()
+        }
+    }
+
+    private func normalizeConfigs(with currentSpaces: [SpaceInfo]) {
+        let spacesByProfile = Dictionary(grouping: currentSpaces) { space in
+            effectiveProfileID(for: space.displayID)
+        }
+
+        var nextConfigsByProfile = configsByProfile
+        var nextMergedConfigs: [UInt64: SpaceConfig] = [:]
+
+        for (profileID, profileSpaces) in spacesByProfile {
+            let activeDisplayIDs = Set(profileSpaces.map(\.displayID))
+            let existingProfileConfigs = configsByProfile[profileID] ?? [:]
+            let sourceConfigs = sourceConfigsForNormalization(profileID: profileID)
+            var consumedSourceIDs = Set<UInt64>()
+
+            var rebuiltProfileConfigs = existingProfileConfigs.filter { _, config in
+                guard let existingDisplayID = config.displayID else {
+                    return false
+                }
+                return !activeDisplayIDs.contains(existingDisplayID)
+            }
+
+            for space in profileSpaces.sorted(by: spaceSortOrder) {
+                let reusable = reusableConfig(
+                    for: space,
+                    in: sourceConfigs,
+                    consumedSourceIDs: consumedSourceIDs
+                )
+                if let reusableID = reusable.id {
+                    consumedSourceIDs.insert(reusableID)
+                }
+
+                let normalizedConfig = normalizedConfig(from: reusable.config, for: space)
+                rebuiltProfileConfigs[space.id] = normalizedConfig
+                nextMergedConfigs[space.id] = normalizedConfig
+            }
+
+            nextConfigsByProfile[profileID] = rebuiltProfileConfigs
+        }
+
+        if currentMode == .inherit {
+            let activeDisplayIDs = Set(currentSpaces.map(\.displayID))
+            pruneActiveDisplayConfigs(from: &nextConfigsByProfile[activeProfileID], activeDisplayIDs: activeDisplayIDs)
+        }
+
+        configsByProfile = nextConfigsByProfile
+        configs = nextMergedConfigs
+    }
+
+    private func sourceConfigsForNormalization(profileID: String) -> [UInt64: SpaceConfig] {
+        var sourceConfigs = configsByProfile[profileID] ?? [:]
+
+        if currentMode == .inherit, profileID != activeProfileID {
+            // Older versions stored inherited-mode names under the topology profile.
+            // Use them as migration sources, then prune them after normalization.
+            sourceConfigs.merge(configsByProfile[activeProfileID] ?? [:]) { current, _ in current }
+        }
+
+        for (spaceID, config) in configs {
+            if let displayID = config.displayID {
+                guard effectiveProfileID(for: displayID) == profileID else { continue }
+            } else if sourceConfigs[spaceID] == nil {
+                continue
+            }
+            sourceConfigs[spaceID] = config
+        }
+
+        return sourceConfigs
+    }
+
+    private func reusableConfig(
+        for spaceInfo: SpaceInfo,
+        in sourceConfigs: [UInt64: SpaceConfig],
+        consumedSourceIDs: Set<UInt64>
+    ) -> (id: UInt64?, config: SpaceConfig?) {
+        if let exact = sourceConfigs[spaceInfo.id] {
+            return (spaceInfo.id, exact)
+        }
+
+        let position = SpacePosition(displayID: spaceInfo.displayID, index: spaceInfo.index)
+        let match = sourceConfigs
+            .filter { id, config in
+                !consumedSourceIDs.contains(id) &&
+                config.hasUserValues &&
+                SpacePosition(displayID: config.displayID ?? spaceInfo.displayID, index: config.displayIndex) == position
+            }
+            .sorted { lhs, rhs in
+                let lhsSameDisplay = lhs.value.displayID == spaceInfo.displayID
+                let rhsSameDisplay = rhs.value.displayID == spaceInfo.displayID
+                if lhsSameDisplay != rhsSameDisplay {
+                    return lhsSameDisplay
+                }
+                return lhs.key < rhs.key
+            }
+            .first
+
+        return (match?.key, match?.value)
+    }
+
+    private func normalizedConfig(from config: SpaceConfig?, for spaceInfo: SpaceInfo) -> SpaceConfig {
+        SpaceConfig(
+            id: spaceInfo.id,
+            name: config?.name ?? "",
+            displayIndex: spaceInfo.index,
+            displayID: spaceInfo.displayID,
+            backgroundColor: config?.backgroundColor?.color,
+            textColor: config?.textColor?.color
+        )
+    }
+
+    private func pruneActiveDisplayConfigs(from profileConfigs: inout [UInt64: SpaceConfig]?, activeDisplayIDs: Set<String>) {
+        guard var configs = profileConfigs else { return }
+
+        configs = configs.filter { _, config in
+            guard let displayID = config.displayID else {
+                return false
+            }
+            return !activeDisplayIDs.contains(displayID)
+        }
+        profileConfigs = configs.isEmpty ? nil : configs
+    }
+
+    private func spaceSortOrder(_ lhs: SpaceInfo, _ rhs: SpaceInfo) -> Bool {
+        if lhs.displayID == rhs.displayID {
+            return lhs.index < rhs.index
+        }
+
+        let lhsDisplayIndex = activeDisplayIDs.firstIndex(of: lhs.displayID)
+        let rhsDisplayIndex = activeDisplayIDs.firstIndex(of: rhs.displayID)
+
+        switch (lhsDisplayIndex, rhsDisplayIndex) {
+        case let (lhsIndex?, rhsIndex?):
+            return lhsIndex < rhsIndex
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        case (nil, nil):
+            return lhs.displayID < rhs.displayID
+        }
+    }
+
     private func persistConfigs() {
         guard let data = try? JSONEncoder().encode(SpaceConfigStore(profiles: configsByProfile)) else {
             return
         }
         UserDefaults.standard.set(data, forKey: userDefaultsKey)
+        UserDefaults.standard.synchronize()
     }
 }
 

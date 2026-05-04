@@ -110,7 +110,7 @@ DesktopTitle/
 リリースは [Release ワークフロー](.github/workflows/release.yml) が `v*` タグの push 時に自動で行います。タグはバージョンバンプ済みの commit を指している必要があります。そうでないと公開される `.app` がリリース名と一致しません。
 
 ```bash
-# 1. project.yml の CFBundleShortVersionString を更新し、プロジェクトを再生成
+# 1. project.yml の CFBundleShortVersionString と CHANGELOG.md を更新し、プロジェクトを再生成
 xcodegen generate
 
 # 2. バージョンバンプを default branch にコミット & push

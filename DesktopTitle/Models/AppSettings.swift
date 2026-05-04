@@ -261,7 +261,7 @@ final class AppSettings: ObservableObject {
         self.showForFullscreen = effectiveProfile.showForFullscreen
 
         persistProfiles()
-        reconcileLaunchAtLoginRegistration()
+        saveGlobalSettings()
     }
 
     func applyDisplayConfiguration(_ configuration: DisplayConfiguration) {
@@ -374,6 +374,7 @@ final class AppSettings: ObservableObject {
 
     private func saveGlobalSettings() {
         defaults.set(launchAtLogin, forKey: Keys.launchAtLogin)
+        defaults.synchronize()
     }
 
     private func updateLaunchAtLoginRegistration() {

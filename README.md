@@ -110,7 +110,7 @@ DesktopTitle/
 Releases are produced by the [Release workflow](.github/workflows/release.yml) on every `v*` tag push. The tag must point at a commit that already contains the version bump, otherwise the published `.app` will not match the release name.
 
 ```bash
-# 1. Bump CFBundleShortVersionString in project.yml, then regenerate the project
+# 1. Bump CFBundleShortVersionString in project.yml, update CHANGELOG.md, then regenerate the project
 xcodegen generate
 
 # 2. Commit the version bump and push it to the default branch

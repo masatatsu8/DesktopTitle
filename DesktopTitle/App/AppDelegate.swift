@@ -77,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         Self.shared = nil
+        spaceConfigManager.syncWithCurrentSpaces()
         spaceMonitor.stopMonitoring()
         displayConfigurationMonitor.stopMonitoring()
         DebugLog.log("AppDelegate", "DesktopTitle terminated")
