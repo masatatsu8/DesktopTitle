@@ -43,7 +43,7 @@ The app lives entirely in the menu bar.
 2. Click the icon and choose **Settings…** to open the configuration window.
 3. **Desktops** tab — give each desktop (Space) a name. In multi-display setups the screen name is shown alongside each desktop, and desktops shared across configurations are labelled `(shared)`.
 4. **Display** tab — adjust font, size, position, colors, display duration, delay, and the space-index toggle.
-5. **General** tab — toggle **Launch at login** and **Show for fullscreen apps**, manage the active per-display profile, or **Reset Current Profile to Defaults**.
+5. **General** tab — toggle **Launch at login** and **Show for fullscreen apps** (off by default), manage the active per-display profile, or **Reset Current Profile to Defaults**.
 6. Switch desktops to see the overlay.
 
 ### Per-display profiles

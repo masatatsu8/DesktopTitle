@@ -155,6 +155,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showOverlay(for space: SpaceInfo, delayOverride: Double? = nil) {
+        guard settings.showForFullscreen || !space.isFullscreen else {
+            DebugLog.log(
+                "AppDelegate",
+                "overlay skipped for fullscreen space because setting is disabled",
+                details: [
+                    "space": DebugLog.describe(space: space)
+                ]
+            )
+            return
+        }
+
         let spaceName = spaceConfigManager.getDisplayName(for: space)
 
         // Determine colors based on unified/per-desktop setting

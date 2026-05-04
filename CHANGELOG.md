@@ -2,6 +2,14 @@
 
 All notable changes to DesktopTitle are documented in this file.
 
+## 1.0.3 - 2026-05-04
+
+### Fixed
+
+- Made the fullscreen overlay toggle default to off and ignore older profile defaults.
+- Improved fullscreen Space detection by checking the CoreGraphics Space type directly.
+- Stopped fullscreen Spaces from being saved as desktop title entries.
+
 ## 1.0.2 - 2026-05-04
 
 ### Fixed

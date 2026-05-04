@@ -49,6 +49,21 @@ final class SpaceIdentifier {
         }
     }
 
+    private func extractInt(from value: Any?) -> Int? {
+        switch value {
+        case let v as Int:
+            return v
+        case let v as Int64:
+            return Int(v)
+        case let v as UInt64:
+            return Int(v)
+        case let v as NSNumber:
+            return v.intValue
+        default:
+            return nil
+        }
+    }
+
     /// Get the current active Space ID
     func getActiveSpaceID() -> UInt64 {
         let connection = _CGSDefaultConnection()
@@ -192,8 +207,14 @@ final class SpaceIdentifier {
             return nil
         }
 
-        let spaceType = spaceDict["type"] as? Int ?? 0
-        let isFullscreen = spaceType == Int(kCGSSpaceFullscreen)
+        let dictionarySpaceType = extractInt(from: spaceDict["type"]) ?? Int(kCGSSpaceUser)
+        let currentSpaceType = Int(CGSSpaceGetType(_CGSDefaultConnection(), finalSpaceID))
+        let isFullscreen =
+            dictionarySpaceType != Int(kCGSSpaceUser) ||
+            currentSpaceType != Int(kCGSSpaceUser) ||
+            spaceDict["TileLayoutManager"] != nil ||
+            spaceDict["WallSpace"] != nil ||
+            spaceDict["fs_wid"] != nil
 
         return SpaceInfo(
             id: finalSpaceID,

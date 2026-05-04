@@ -242,7 +242,7 @@ final class SpaceConfigManager: ObservableObject {
 
     /// Sync configurations with current spaces (remove stale, add new)
     func syncWithCurrentSpaces() {
-        let currentSpaces = SpaceIdentifier.shared.getAllSpaces()
+        let currentSpaces = SpaceIdentifier.shared.getAllSpaces().filter { !$0.isFullscreen }
         guard !currentSpaces.isEmpty else { return }
 
         normalizeConfigs(with: currentSpaces)
@@ -273,7 +273,7 @@ final class SpaceConfigManager: ObservableObject {
 
     /// Save current merged configs back to the correct underlying profiles.
     private func saveCurrentConfigs() {
-        let currentSpaces = SpaceIdentifier.shared.getAllSpaces()
+        let currentSpaces = SpaceIdentifier.shared.getAllSpaces().filter { !$0.isFullscreen }
         guard !currentSpaces.isEmpty else { return }
 
         normalizeConfigs(with: currentSpaces)

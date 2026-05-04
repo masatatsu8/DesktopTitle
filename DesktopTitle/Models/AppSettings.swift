@@ -20,7 +20,6 @@ private struct AppSettingsProfile: Codable, Equatable {
     var backgroundColor: CodableColor
     var textColor: CodableColor
     var fontName: String
-    var showForFullscreen: Bool
 
     static let `default` = AppSettingsProfile(
         fontSize: 48,
@@ -32,8 +31,7 @@ private struct AppSettingsProfile: Codable, Equatable {
         useUnifiedColors: true,
         backgroundColor: CodableColor(Color.black.opacity(0.6)),
         textColor: CodableColor(.white),
-        fontName: "",
-        showForFullscreen: true
+        fontName: ""
     )
 }
 
@@ -151,7 +149,7 @@ final class AppSettings: ObservableObject {
 
     /// Whether to show overlay for fullscreen spaces
     @Published var showForFullscreen: Bool {
-        didSet { saveActiveProfile() }
+        didSet { saveGlobalSettings() }
     }
 
     /// The active screen configuration that owns the current profile.
@@ -205,7 +203,7 @@ final class AppSettings: ObservableObject {
         static let legacyBackgroundColor = "backgroundColor"
         static let legacyTextColor = "textColor"
         static let legacyFontName = "fontName"
-        static let legacyShowForFullscreen = "showForFullscreen"
+        static let showForFullscreen = "appSettings.showForFullscreen"
     }
 
     private init() {
@@ -258,7 +256,7 @@ final class AppSettings: ObservableObject {
         self.fontName = effectiveProfile.fontName
         let storedLaunchAtLogin = defaults.object(forKey: Keys.launchAtLogin) as? Bool
         self.launchAtLogin = storedLaunchAtLogin ?? Self.isLaunchAtLoginRequested
-        self.showForFullscreen = effectiveProfile.showForFullscreen
+        self.showForFullscreen = defaults.object(forKey: Keys.showForFullscreen) as? Bool ?? false
 
         persistProfiles()
         saveGlobalSettings()
@@ -374,6 +372,7 @@ final class AppSettings: ObservableObject {
 
     private func saveGlobalSettings() {
         defaults.set(launchAtLogin, forKey: Keys.launchAtLogin)
+        defaults.set(showForFullscreen, forKey: Keys.showForFullscreen)
         defaults.synchronize()
     }
 
@@ -475,8 +474,7 @@ final class AppSettings: ObservableObject {
             useUnifiedColors: useUnifiedColors,
             backgroundColor: CodableColor(backgroundColor),
             textColor: CodableColor(textColor),
-            fontName: fontName,
-            showForFullscreen: showForFullscreen
+            fontName: fontName
         )
     }
 
@@ -492,7 +490,6 @@ final class AppSettings: ObservableObject {
         backgroundColor = profile.backgroundColor.color
         textColor = profile.textColor.color
         fontName = profile.fontName
-        showForFullscreen = profile.showForFullscreen
         isApplyingProfile = false
     }
 
@@ -548,8 +545,7 @@ final class AppSettings: ObservableObject {
             textColor: CodableColor(
                 loadColor(from: defaults, forKey: Keys.legacyTextColor) ?? AppSettingsProfile.default.textColor.color
             ),
-            fontName: defaults.string(forKey: Keys.legacyFontName) ?? AppSettingsProfile.default.fontName,
-            showForFullscreen: defaults.object(forKey: Keys.legacyShowForFullscreen) as? Bool ?? AppSettingsProfile.default.showForFullscreen
+            fontName: defaults.string(forKey: Keys.legacyFontName) ?? AppSettingsProfile.default.fontName
         )
     }
 
