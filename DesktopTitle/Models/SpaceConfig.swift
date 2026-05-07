@@ -2,14 +2,61 @@
 //  SpaceConfig.swift
 //  DesktopTitle
 //
-//  Configuration for individual Spaces
+//  Per-Space user configuration (name + colors).
+//
+//  Storage model: a single flat dictionary keyed by the stable Space
+//  identity `"displayID:displayIndex"`. The display topology (which
+//  displays are connected at any moment) does NOT affect storage —
+//  names and colors persist regardless of which displays are plugged
+//  in. Earlier versions stored per-topology copies and silently lost
+//  data when the topology changed; the legacy data is migrated into
+//  the flat store on first load.
 //
 
 import Foundation
 import SwiftUI
 
+/// Stable, display-positioned user data for a Space.
+private struct SpaceProfileData: Codable, Equatable {
+    var name: String = ""
+    var backgroundColor: CodableColor?
+    var textColor: CodableColor?
+
+    var hasUserValues: Bool {
+        !name.isEmpty || backgroundColor != nil || textColor != nil
+    }
+}
+
 private struct SpaceConfigStore: Codable {
-    var profiles: [String: [UInt64: SpaceConfig]]
+    /// Authoritative store: stable key (`"displayID:displayIndex"`) → user data.
+    var spaceProfiles: [String: SpaceProfileData]?
+
+    /// Legacy per-topology storage. Read for migration, never written.
+    var profiles: [String: [UInt64: SpaceConfig]]?
+
+    init(spaceProfiles: [String: SpaceProfileData]) {
+        self.spaceProfiles = spaceProfiles
+        self.profiles = nil
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        spaceProfiles = try c.decodeIfPresent([String: SpaceProfileData].self, forKey: .spaceProfiles)
+        profiles = try c.decodeIfPresent([String: [UInt64: SpaceConfig]].self, forKey: .profiles)
+
+        // The very-old bare-`[UInt64: SpaceConfig]` format has neither key,
+        // and the keyed container would silently decode it as an empty
+        // store — losing every user-edited name and color. Fail decoding
+        // here so `loadConfigs` falls through to the bare-dict path.
+        guard spaceProfiles != nil || profiles != nil else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "SpaceConfigStore has neither `spaceProfiles` nor `profiles`; treat as legacy bare-dict format."
+                )
+            )
+        }
+    }
 }
 
 /// Codable wrapper for Color
@@ -59,441 +106,299 @@ struct SpaceConfig: Codable, Identifiable, Equatable {
     }
 }
 
-/// Manager for Space configurations
+/// Manager for Space configurations.
+///
+/// All per-Space user data lives in a single dictionary keyed by
+/// `"displayID:displayIndex"`. Topology / profile-mode parameters
+/// passed via `setActiveProfile` are accepted for API compatibility
+/// but no longer affect what is stored or read.
 final class SpaceConfigManager: ObservableObject {
 
     static let shared = SpaceConfigManager()
 
-    private struct SpacePosition: Hashable {
-        let displayID: String
-        let index: Int
-    }
-
     @Published private(set) var configs: [UInt64: SpaceConfig] = [:]
 
     private let userDefaultsKey = "SpaceConfigs"
-    private var configsByProfile: [String: [UInt64: SpaceConfig]] = [:]
-    private var activeProfileID: String = DisplayConfiguration.current().id
-    private var currentMode: ProfileMode = .independent
-    private var currentBaseProfileID: String?
-    /// Display IDs that belong to the base profile (used in inherit mode)
-    private var baseDisplayIDs: Set<String> = []
-    private var activeDisplayIDs: Set<String> = []
+    private var spaceProfiles: [String: SpaceProfileData] = [:]
 
     private init() {
         loadConfigs()
-        configs = configsByProfile[activeProfileID] ?? [:]
+        refreshConfigs()
     }
 
+    // MARK: - Public API
+
+    /// Refresh the published `configs` view. Topology parameters are
+    /// retained for API compatibility but no longer affect storage.
     func setActiveProfile(_ profileID: String, mode: ProfileMode = .independent, baseProfileID: String? = nil, displayIDs: [String] = []) {
-        // Save current configs before switching
-        saveCurrentConfigs()
-
-        activeProfileID = profileID
-        currentMode = mode
-        currentBaseProfileID = baseProfileID
-        activeDisplayIDs = Set(displayIDs)
-
-        // Determine which display IDs belong to the base profile
-        if mode == .inherit, let baseID = baseProfileID {
-            // The base profile ID is a single display UUID
-            baseDisplayIDs = Set([baseID])
-        } else {
-            baseDisplayIDs = []
-        }
-
-        rebuildMergedConfigs()
-        saveConfigs()
+        refreshConfigs()
     }
 
-    /// Get the effective profile ID for a given space based on which display it's on.
-    private func effectiveProfileID(for displayID: String) -> String {
-        if currentMode == .inherit {
-            if let baseID = currentBaseProfileID, baseDisplayIDs.contains(displayID) {
-                return baseID
-            }
-
-            // External displays keep their desktop names with the display itself,
-            // not with the transient "built-in + external" topology profile.
-            return displayID
-        }
-
-        return activeProfileID
-    }
-
-    /// Rebuild the merged configs view from base + own profiles.
-    private func rebuildMergedConfigs() {
-        if currentMode == .inherit, let baseID = currentBaseProfileID {
-            var merged: [UInt64: SpaceConfig] = [:]
-            // Add base profile's configs (for built-in display spaces)
-            if let baseConfigs = configsByProfile[baseID] {
-                for (id, config) in baseConfigs {
-                    merged[id] = config
-                }
-            }
-            // Add legacy topology-level configs so existing saved names remain visible.
-            if let ownConfigs = configsByProfile[activeProfileID] {
-                for (id, config) in ownConfigs {
-                    merged[id] = config
-                }
-            }
-            // Add per-display configs for currently attached external displays.
-            for displayID in activeDisplayIDs where !baseDisplayIDs.contains(displayID) {
-                if let displayConfigs = configsByProfile[displayID] {
-                    for (id, config) in displayConfigs {
-                        merged[id] = config
-                    }
-                }
-            }
-            configs = merged
-        } else {
-            configs = configsByProfile[activeProfileID] ?? [:]
-        }
-    }
-
-    /// Get or create config for a space
+    /// Get or create config for a space.
     func getConfig(for spaceInfo: SpaceInfo) -> SpaceConfig {
-        if let existing = configs[spaceInfo.id] {
-            return existing
-        }
-
-        if let reusable = reusableConfig(for: spaceInfo)?.config {
-            return reusable
-        }
-
-        let config = SpaceConfig(
+        let key = Self.stableKey(displayID: spaceInfo.displayID, displayIndex: spaceInfo.index)
+        let data = spaceProfiles[key]
+        return SpaceConfig(
             id: spaceInfo.id,
-            name: "",
+            name: data?.name ?? "",
             displayIndex: spaceInfo.index,
-            displayID: spaceInfo.displayID
+            displayID: spaceInfo.displayID,
+            backgroundColor: data?.backgroundColor?.color,
+            textColor: data?.textColor?.color
         )
-        return config
     }
 
-    /// Update the name for a space
+    /// Update the name for a space.
     func setName(_ name: String, for spaceID: UInt64, displayIndex: Int, displayID: String? = nil) {
-        syncBeforeEditingIfNeeded(spaceID: spaceID, displayIndex: displayIndex, displayID: displayID)
-
-        var config = configs[spaceID] ?? SpaceConfig(id: spaceID, displayIndex: displayIndex, displayID: displayID)
-        config.name = name
-        config.displayIndex = displayIndex
-        config.displayID = displayID ?? config.displayID
-        configs[spaceID] = config
-
-        // Route to the correct profile
-        let profileID = displayID.map { effectiveProfileID(for: $0) } ?? activeProfileID
-        var profileConfigs = configsByProfile[profileID] ?? [:]
-        removeStaleConfigs(
-            from: &profileConfigs,
-            keeping: spaceID,
-            displayIndex: displayIndex,
-            displayID: displayID
-        )
-        profileConfigs[spaceID] = config
-        configsByProfile[profileID] = profileConfigs
+        guard let resolvedDisplayID = resolveDisplayID(provided: displayID, spaceID: spaceID) else {
+            DebugLog.log("SpaceConfigManager", "setName ignored — displayID could not be resolved", details: [
+                "spaceID": "\(spaceID)",
+                "displayIndex": "\(displayIndex)"
+            ])
+            return
+        }
+        let key = Self.stableKey(displayID: resolvedDisplayID, displayIndex: displayIndex)
+        var data = spaceProfiles[key] ?? SpaceProfileData()
+        data.name = name
+        spaceProfiles[key] = data
         persistConfigs()
+        refreshConfigs()
     }
 
-    /// Update colors for a space
+    /// Update colors for a space.
     func setColors(backgroundColor: Color?, textColor: Color?, for spaceID: UInt64, displayIndex: Int, displayID: String? = nil) {
-        syncBeforeEditingIfNeeded(spaceID: spaceID, displayIndex: displayIndex, displayID: displayID)
-
-        var config = configs[spaceID] ?? SpaceConfig(id: spaceID, displayIndex: displayIndex, displayID: displayID)
-        config.backgroundColor = backgroundColor.map { CodableColor($0) }
-        config.textColor = textColor.map { CodableColor($0) }
-        config.displayIndex = displayIndex
-        config.displayID = displayID ?? config.displayID
-        configs[spaceID] = config
-
-        let profileID = displayID.map { effectiveProfileID(for: $0) } ?? activeProfileID
-        var profileConfigs = configsByProfile[profileID] ?? [:]
-        removeStaleConfigs(
-            from: &profileConfigs,
-            keeping: spaceID,
-            displayIndex: displayIndex,
-            displayID: displayID
-        )
-        profileConfigs[spaceID] = config
-        configsByProfile[profileID] = profileConfigs
+        guard let resolvedDisplayID = resolveDisplayID(provided: displayID, spaceID: spaceID) else {
+            DebugLog.log("SpaceConfigManager", "setColors ignored — displayID could not be resolved", details: [
+                "spaceID": "\(spaceID)",
+                "displayIndex": "\(displayIndex)"
+            ])
+            return
+        }
+        let key = Self.stableKey(displayID: resolvedDisplayID, displayIndex: displayIndex)
+        var data = spaceProfiles[key] ?? SpaceProfileData()
+        data.backgroundColor = backgroundColor.map { CodableColor($0) }
+        data.textColor = textColor.map { CodableColor($0) }
+        spaceProfiles[key] = data
         persistConfigs()
+        refreshConfigs()
     }
 
-    /// Get background color for a space (returns nil if not set)
+    /// Get background color for a space (returns nil if not set).
     func getBackgroundColor(for spaceInfo: SpaceInfo) -> Color? {
         return getConfig(for: spaceInfo).backgroundColor?.color
     }
 
-    /// Get text color for a space (returns nil if not set)
+    /// Get text color for a space (returns nil if not set).
     func getTextColor(for spaceInfo: SpaceInfo) -> Color? {
         return getConfig(for: spaceInfo).textColor?.color
     }
 
-    /// Get the display name for a space
+    /// Get the display name for a space.
     func getDisplayName(for spaceInfo: SpaceInfo) -> String {
         return getConfig(for: spaceInfo).displayName()
     }
 
-    /// Clear all configs
+    /// Clear all configs.
     func clearAll() {
-        configs.removeAll()
-        configsByProfile.removeAll()
+        spaceProfiles.removeAll()
         persistConfigs()
+        refreshConfigs()
     }
 
-    /// Sync configurations with current spaces (remove stale, add new)
+    /// Sync configurations with current spaces (refresh published view).
     func syncWithCurrentSpaces() {
-        let currentSpaces = SpaceIdentifier.shared.getAllSpaces().filter { !$0.isFullscreen }
-        guard !currentSpaces.isEmpty else { return }
-
-        normalizeConfigs(with: currentSpaces)
-        persistConfigs()
+        refreshConfigs()
     }
 
-    /// Whether a space belongs to the base (inherited) profile
+    /// Per-Space data is no longer scoped by topology, so nothing is
+    /// "inherited". Kept for API compatibility.
     func isInheritedSpace(_ spaceInfo: SpaceInfo) -> Bool {
-        currentMode == .inherit && baseDisplayIDs.contains(spaceInfo.displayID)
+        return false
     }
 
-    // MARK: - Persistence
+    // MARK: - Private
+
+    private static func stableKey(displayID: String, displayIndex: Int) -> String {
+        "\(displayID):\(displayIndex)"
+    }
+
+    /// Resolve the displayID for a setter call. Callers usually pass it
+    /// explicitly, but the parameter has a `nil` default for API
+    /// compatibility — when that path is taken, fall back to the
+    /// SpaceConfig the caller already knows about (via `configs` or
+    /// the live SpaceIdentifier list) so the write does not silently
+    /// no-op when the caller forgets to thread the displayID through.
+    private func resolveDisplayID(provided: String?, spaceID: UInt64) -> String? {
+        if let provided { return provided }
+        if let existing = configs[spaceID]?.displayID { return existing }
+        if let live = SpaceIdentifier.shared.getAllSpaces().first(where: { $0.id == spaceID }) {
+            return live.displayID
+        }
+        return nil
+    }
+
+    private func refreshConfigs() {
+        let currentSpaces = SpaceIdentifier.shared.getAllSpaces()
+            .filter { !$0.isFullscreen }
+        var newConfigs: [UInt64: SpaceConfig] = [:]
+        for space in currentSpaces {
+            newConfigs[space.id] = getConfig(for: space)
+        }
+        configs = newConfigs
+    }
+
+    private func persistConfigs() {
+        let store = SpaceConfigStore(spaceProfiles: spaceProfiles)
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(store)
+        } catch {
+            DebugLog.log("SpaceConfigManager", "persist failed", details: [
+                "error": "\(error)",
+                "spaceProfilesCount": "\(spaceProfiles.count)"
+            ])
+            return
+        }
+        UserDefaults.standard.set(data, forKey: userDefaultsKey)
+    }
 
     private func loadConfigs() {
         guard let data = UserDefaults.standard.data(forKey: userDefaultsKey) else {
             return
         }
 
-        if let decoded = try? JSONDecoder().decode(SpaceConfigStore.self, from: data) {
-            configsByProfile = decoded.profiles
+        if let store = try? JSONDecoder().decode(SpaceConfigStore.self, from: data) {
+            if let master = store.spaceProfiles {
+                spaceProfiles = master
+            }
+            // Migrate legacy per-topology data. Existing master entries take
+            // precedence so re-running migration never overwrites fresh data.
+            if let legacy = store.profiles {
+                migrateLegacyTopologyConfigs(legacy)
+            }
+            DebugLog.log("SpaceConfigManager", "loaded configs", details: [
+                "spaceProfilesCount": "\(spaceProfiles.count)",
+                "legacyTopologyCount": "\(store.profiles?.count ?? 0)"
+            ])
             return
         }
 
-        if let legacyConfigs = try? JSONDecoder().decode([UInt64: SpaceConfig].self, from: data) {
-            configsByProfile[activeProfileID] = legacyConfigs
+        // Very old format: bare `[UInt64: SpaceConfig]`.
+        if let veryLegacy = try? JSONDecoder().decode([UInt64: SpaceConfig].self, from: data) {
+            migrateBareDictConfigs(veryLegacy)
+            // Persist immediately so we never re-read the legacy format again.
+            persistConfigs()
         }
     }
 
-    /// Save current merged configs back to the correct underlying profiles.
-    private func saveCurrentConfigs() {
-        let currentSpaces = SpaceIdentifier.shared.getAllSpaces().filter { !$0.isFullscreen }
-        guard !currentSpaces.isEmpty else { return }
-
-        normalizeConfigs(with: currentSpaces)
-    }
-
-    private func removeStaleConfigs(
-        from profileConfigs: inout [UInt64: SpaceConfig],
-        keeping spaceID: UInt64,
-        displayIndex: Int,
-        displayID: String?
-    ) {
-        guard let displayID else { return }
-
-        profileConfigs = profileConfigs.filter { existingSpaceID, config in
-            if existingSpaceID == spaceID {
-                return true
-            }
-
-            let sameDisplay = config.displayID == nil || config.displayID == displayID
-            return !(sameDisplay && config.displayIndex == displayIndex)
-        }
-    }
-
-    private func reusableConfig(for spaceInfo: SpaceInfo) -> (id: UInt64?, config: SpaceConfig)? {
-        let profileID = effectiveProfileID(for: spaceInfo.displayID)
-        guard let profileConfigs = configsByProfile[profileID] else { return nil }
-
-        if var exact = profileConfigs[spaceInfo.id] {
-            exact.displayIndex = spaceInfo.index
-            exact.displayID = spaceInfo.displayID
-            return (nil, exact)
-        }
-
-        guard let match = profileConfigs.first(where: { _, config in
-            config.hasUserValues &&
-            config.displayIndex == spaceInfo.index &&
-            (config.displayID == nil || config.displayID == spaceInfo.displayID)
-        }) else {
-            return nil
-        }
-
-        let config = SpaceConfig(
-            id: spaceInfo.id,
-            name: match.value.name,
-            displayIndex: spaceInfo.index,
-            displayID: spaceInfo.displayID,
-            backgroundColor: match.value.backgroundColor?.color,
-            textColor: match.value.textColor?.color
+    /// Best-effort displayID resolution for the very-old bare-dict format,
+    /// which predates per-Space `displayID` tracking. Try (1) the current
+    /// SpaceIdentifier list keyed by `spaceID`, (2) the `displayIndex`
+    /// position when the user is on a single display, and (3) skip with
+    /// a log entry if neither yields a result.
+    private func migrateBareDictConfigs(_ legacy: [UInt64: SpaceConfig]) {
+        let liveSpaces = SpaceIdentifier.shared.getAllSpaces().filter { !$0.isFullscreen }
+        let displayIDByLiveSpace: [UInt64: String] = Dictionary(
+            liveSpaces.map { ($0.id, $0.displayID) },
+            uniquingKeysWith: { first, _ in first }
         )
-        return (match.key, config)
+        let liveDisplayIDs = Set(liveSpaces.map(\.displayID))
+        let singleDisplayFallback: String? = liveDisplayIDs.count == 1 ? liveDisplayIDs.first : nil
+
+        var migrated = 0
+        var skipped = 0
+        for spaceID in legacy.keys.sorted() {
+            guard let config = legacy[spaceID] else { continue }
+            let candidate = SpaceProfileData(
+                name: config.name,
+                backgroundColor: config.backgroundColor,
+                textColor: config.textColor
+            )
+            guard candidate.hasUserValues else { continue }
+
+            let resolvedDisplayID = config.displayID
+                ?? displayIDByLiveSpace[spaceID]
+                ?? singleDisplayFallback
+            if migrateSingleConfig(config, fallbackDisplayID: resolvedDisplayID, sourceKey: "bare-dict") {
+                migrated += 1
+            } else if resolvedDisplayID == nil {
+                skipped += 1
+                DebugLog.log("SpaceConfigManager", "bare-dict migration skipped (displayID unresolved)", details: [
+                    "spaceID": "\(spaceID)",
+                    "displayIndex": "\(config.displayIndex)",
+                    "name": config.name
+                ])
+            }
+        }
+        DebugLog.log("SpaceConfigManager", "bare-dict migration done", details: [
+            "migrated": "\(migrated)",
+            "skipped": "\(skipped)",
+            "totalCandidates": "\(legacy.count)"
+        ])
     }
 
-    private func saveConfigs() {
-        saveCurrentConfigs()
+    private func migrateLegacyTopologyConfigs(_ legacy: [String: [UInt64: SpaceConfig]]) {
+        // Process single-display profiles BEFORE multi-display topologies, then
+        // sort each group by key. A single-display profile's data is rooted in
+        // the physical display, so when multiple legacy profiles claim the
+        // same `displayID:displayIndex` we trust the single-display copy. The
+        // alphabetical sort within each group keeps migration output
+        // deterministic regardless of Dictionary iteration order.
+        let orderedKeys = legacy.keys.sorted { lhs, rhs in
+            let lhsMulti = lhs.contains("|")
+            let rhsMulti = rhs.contains("|")
+            if lhsMulti != rhsMulti { return !lhsMulti }
+            return lhs < rhs
+        }
+
+        var migrated = 0
+        for legacyKey in orderedKeys {
+            guard let configs = legacy[legacyKey] else { continue }
+            // Single-display topology keys are themselves the displayID; use them
+            // as a fallback for entries whose `displayID` field is missing.
+            let fallbackDisplayID: String? = legacyKey.contains("|") ? nil : legacyKey
+            // Within a single profile, sort by spaceID to keep ordering stable.
+            for spaceID in configs.keys.sorted() {
+                guard let config = configs[spaceID] else { continue }
+                if migrateSingleConfig(config, fallbackDisplayID: fallbackDisplayID, sourceKey: legacyKey) {
+                    migrated += 1
+                }
+            }
+        }
+        DebugLog.log("SpaceConfigManager", "legacy topology migration done", details: [
+            "migrated": "\(migrated)",
+            "legacyKeys": "\(legacy.count)"
+        ])
+        // Always persist after a migration pass so the legacy `profiles`
+        // field is dropped from UserDefaults even when every entry was a
+        // collision (migrated == 0). Otherwise the old data sticks around
+        // and the same collision logs reappear on every launch.
         persistConfigs()
     }
 
-    private func syncBeforeEditingIfNeeded(spaceID: UInt64, displayIndex: Int, displayID: String?) {
-        guard let config = configs[spaceID] else {
-            saveCurrentConfigs()
-            return
-        }
+    @discardableResult
+    private func migrateSingleConfig(_ config: SpaceConfig, fallbackDisplayID: String?, sourceKey: String? = nil) -> Bool {
+        let displayID = config.displayID ?? fallbackDisplayID
+        guard let displayID else { return false }
 
-        if config.displayIndex != displayIndex || config.displayID != displayID {
-            saveCurrentConfigs()
-        }
-    }
-
-    private func normalizeConfigs(with currentSpaces: [SpaceInfo]) {
-        let spacesByProfile = Dictionary(grouping: currentSpaces) { space in
-            effectiveProfileID(for: space.displayID)
-        }
-
-        var nextConfigsByProfile = configsByProfile
-        var nextMergedConfigs: [UInt64: SpaceConfig] = [:]
-
-        for (profileID, profileSpaces) in spacesByProfile {
-            let activeDisplayIDs = Set(profileSpaces.map(\.displayID))
-            let existingProfileConfigs = configsByProfile[profileID] ?? [:]
-            let sourceConfigs = sourceConfigsForNormalization(profileID: profileID)
-            var consumedSourceIDs = Set<UInt64>()
-
-            var rebuiltProfileConfigs = existingProfileConfigs.filter { _, config in
-                guard let existingDisplayID = config.displayID else {
-                    return false
-                }
-                return !activeDisplayIDs.contains(existingDisplayID)
-            }
-
-            for space in profileSpaces.sorted(by: spaceSortOrder) {
-                let reusable = reusableConfig(
-                    for: space,
-                    in: sourceConfigs,
-                    consumedSourceIDs: consumedSourceIDs
-                )
-                if let reusableID = reusable.id {
-                    consumedSourceIDs.insert(reusableID)
-                }
-
-                let normalizedConfig = normalizedConfig(from: reusable.config, for: space)
-                rebuiltProfileConfigs[space.id] = normalizedConfig
-                nextMergedConfigs[space.id] = normalizedConfig
-            }
-
-            nextConfigsByProfile[profileID] = rebuiltProfileConfigs
-        }
-
-        if currentMode == .inherit {
-            let activeDisplayIDs = Set(currentSpaces.map(\.displayID))
-            pruneActiveDisplayConfigs(from: &nextConfigsByProfile[activeProfileID], activeDisplayIDs: activeDisplayIDs)
-        }
-
-        configsByProfile = nextConfigsByProfile
-        configs = nextMergedConfigs
-    }
-
-    private func sourceConfigsForNormalization(profileID: String) -> [UInt64: SpaceConfig] {
-        var sourceConfigs = configsByProfile[profileID] ?? [:]
-
-        if currentMode == .inherit, profileID != activeProfileID {
-            // Older versions stored inherited-mode names under the topology profile.
-            // Use them as migration sources, then prune them after normalization.
-            sourceConfigs.merge(configsByProfile[activeProfileID] ?? [:]) { current, _ in current }
-        }
-
-        for (spaceID, config) in configs {
-            if let displayID = config.displayID {
-                guard effectiveProfileID(for: displayID) == profileID else { continue }
-            } else if sourceConfigs[spaceID] == nil {
-                continue
-            }
-            sourceConfigs[spaceID] = config
-        }
-
-        return sourceConfigs
-    }
-
-    private func reusableConfig(
-        for spaceInfo: SpaceInfo,
-        in sourceConfigs: [UInt64: SpaceConfig],
-        consumedSourceIDs: Set<UInt64>
-    ) -> (id: UInt64?, config: SpaceConfig?) {
-        if let exact = sourceConfigs[spaceInfo.id] {
-            return (spaceInfo.id, exact)
-        }
-
-        let position = SpacePosition(displayID: spaceInfo.displayID, index: spaceInfo.index)
-        let match = sourceConfigs
-            .filter { id, config in
-                !consumedSourceIDs.contains(id) &&
-                config.hasUserValues &&
-                SpacePosition(displayID: config.displayID ?? spaceInfo.displayID, index: config.displayIndex) == position
-            }
-            .sorted { lhs, rhs in
-                let lhsSameDisplay = lhs.value.displayID == spaceInfo.displayID
-                let rhsSameDisplay = rhs.value.displayID == spaceInfo.displayID
-                if lhsSameDisplay != rhsSameDisplay {
-                    return lhsSameDisplay
-                }
-                return lhs.key < rhs.key
-            }
-            .first
-
-        return (match?.key, match?.value)
-    }
-
-    private func normalizedConfig(from config: SpaceConfig?, for spaceInfo: SpaceInfo) -> SpaceConfig {
-        SpaceConfig(
-            id: spaceInfo.id,
-            name: config?.name ?? "",
-            displayIndex: spaceInfo.index,
-            displayID: spaceInfo.displayID,
-            backgroundColor: config?.backgroundColor?.color,
-            textColor: config?.textColor?.color
+        let candidate = SpaceProfileData(
+            name: config.name,
+            backgroundColor: config.backgroundColor,
+            textColor: config.textColor
         )
-    }
+        guard candidate.hasUserValues else { return false }
 
-    private func pruneActiveDisplayConfigs(from profileConfigs: inout [UInt64: SpaceConfig]?, activeDisplayIDs: Set<String>) {
-        guard var configs = profileConfigs else { return }
-
-        configs = configs.filter { _, config in
-            guard let displayID = config.displayID else {
-                return false
-            }
-            return !activeDisplayIDs.contains(displayID)
-        }
-        profileConfigs = configs.isEmpty ? nil : configs
-    }
-
-    private func spaceSortOrder(_ lhs: SpaceInfo, _ rhs: SpaceInfo) -> Bool {
-        if lhs.displayID == rhs.displayID {
-            return lhs.index < rhs.index
-        }
-
-        let lhsDisplayIndex = activeDisplayIDs.firstIndex(of: lhs.displayID)
-        let rhsDisplayIndex = activeDisplayIDs.firstIndex(of: rhs.displayID)
-
-        switch (lhsDisplayIndex, rhsDisplayIndex) {
-        case let (lhsIndex?, rhsIndex?):
-            return lhsIndex < rhsIndex
-        case (_?, nil):
-            return true
-        case (nil, _?):
+        let key = Self.stableKey(displayID: displayID, displayIndex: config.displayIndex)
+        if let existing = spaceProfiles[key], existing.hasUserValues {
+            DebugLog.log("SpaceConfigManager", "migration collision (kept first)", details: [
+                "key": key,
+                "kept": existing.name,
+                "skippedSource": sourceKey ?? "(unknown)",
+                "skippedName": candidate.name
+            ])
             return false
-        case (nil, nil):
-            return lhs.displayID < rhs.displayID
         }
-    }
-
-    private func persistConfigs() {
-        guard let data = try? JSONEncoder().encode(SpaceConfigStore(profiles: configsByProfile)) else {
-            return
-        }
-        UserDefaults.standard.set(data, forKey: userDefaultsKey)
-        UserDefaults.standard.synchronize()
-    }
-}
-
-private extension SpaceConfig {
-    var hasUserValues: Bool {
-        !name.isEmpty || backgroundColor != nil || textColor != nil
+        spaceProfiles[key] = candidate
+        return true
     }
 }
