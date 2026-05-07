@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 
 /// Controls the menu bar icon and menu
@@ -13,9 +14,24 @@ final class MenuBarController {
 
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
+    private var cancellables = Set<AnyCancellable>()
+    /// Last resolved Space name applied to the status button. Held so the
+    /// `showMenuBarTitle` toggle can re-render the button immediately,
+    /// without waiting for the next Space change.
+    private var currentSpaceName: String?
 
     init() {
         setupStatusItem()
+        observeSettingsChanges()
+    }
+
+    private func observeSettingsChanges() {
+        AppSettings.shared.$showMenuBarTitle
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.applyStatusButtonTitle()
+            }
+            .store(in: &cancellables)
     }
 
     private func setupStatusItem() {
@@ -67,18 +83,22 @@ final class MenuBarController {
 
         if let space = spaceInfo {
             let name = SpaceConfigManager.shared.getDisplayName(for: space)
+            currentSpaceName = name
             currentItem.title = "Current: \(name)"
-            updateStatusButtonTitle(name)
         } else {
+            currentSpaceName = nil
             currentItem.title = "Current: Unknown"
-            updateStatusButtonTitle(nil)
         }
+        applyStatusButtonTitle()
     }
 
-    private func updateStatusButtonTitle(_ title: String?) {
+    /// Render the status button title from the cached `currentSpaceName`
+    /// according to the current `showMenuBarTitle` setting. Called on
+    /// Space changes and on toggle changes.
+    private func applyStatusButtonTitle() {
         guard let button = statusItem?.button else { return }
 
-        if AppSettings.shared.showMenuBarTitle, let title, !title.isEmpty {
+        if AppSettings.shared.showMenuBarTitle, let title = currentSpaceName, !title.isEmpty {
             button.title = " \(title)"
             button.toolTip = "DesktopTitle: \(title)"
         } else {
