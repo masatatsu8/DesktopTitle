@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 
 /// Controls the menu bar icon and menu
@@ -13,9 +14,32 @@ final class MenuBarController {
 
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
+    private var cancellables = Set<AnyCancellable>()
+    /// Most recent Space the controller was told about. Held so that
+    /// changes to `showMenuBarTitle` or to the Space's user-edited name
+    /// (via SpaceConfigManager) can re-render the status button
+    /// immediately, without waiting for the next Space switch.
+    private var currentSpace: SpaceInfo?
 
     init() {
         setupStatusItem()
+        observeReactiveSources()
+    }
+
+    private func observeReactiveSources() {
+        AppSettings.shared.$showMenuBarTitle
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshMenuAndButton()
+            }
+            .store(in: &cancellables)
+
+        SpaceConfigManager.shared.$configs
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshMenuAndButton()
+            }
+            .store(in: &cancellables)
     }
 
     private func setupStatusItem() {
@@ -24,6 +48,9 @@ final class MenuBarController {
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "rectangle.split.3x1", accessibilityDescription: "DesktopTitle")
             button.image?.isTemplate = true
+            button.imagePosition = .imageLeading
+            button.font = .menuBarFont(ofSize: 0)
+            button.toolTip = "DesktopTitle"
         }
 
         setupMenu()
@@ -57,16 +84,28 @@ final class MenuBarController {
 
     /// Update the current space display in the menu
     func updateCurrentSpace(_ spaceInfo: SpaceInfo?) {
-        guard let menu = statusItem?.menu,
-              let currentItem = menu.item(withTag: 100) else {
-            return
+        currentSpace = spaceInfo
+        refreshMenuAndButton()
+    }
+
+    /// Re-render both the menu's "Current: ..." item and the status
+    /// button title from the latest `currentSpace`. Triggered by Space
+    /// changes (`updateCurrentSpace`), `showMenuBarTitle` toggles, and
+    /// SpaceConfigManager updates (e.g. user editing a Space name).
+    private func refreshMenuAndButton() {
+        let resolvedName = currentSpace.map { SpaceConfigManager.shared.getDisplayName(for: $0) }
+
+        if let menu = statusItem?.menu, let currentItem = menu.item(withTag: 100) {
+            currentItem.title = "Current: \(resolvedName ?? "Unknown")"
         }
 
-        if let space = spaceInfo {
-            let name = SpaceConfigManager.shared.getDisplayName(for: space)
-            currentItem.title = "Current: \(name)"
+        guard let button = statusItem?.button else { return }
+        if AppSettings.shared.showMenuBarTitle, let title = resolvedName, !title.isEmpty {
+            button.title = " \(title)"
+            button.toolTip = "DesktopTitle: \(title)"
         } else {
-            currentItem.title = "Current: Unknown"
+            button.title = ""
+            button.toolTip = "DesktopTitle"
         }
     }
 
