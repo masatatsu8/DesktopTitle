@@ -16,6 +16,7 @@
 		48C9E79EA1A7417AE7156E0D /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 683A0DFD101FE3C256FE669C /* AppSettings.swift */; };
 		8B29D6971F27F9CF1CEA853C /* OverlayWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E537F6AB1A07EA0AE1B8173C /* OverlayWindow.swift */; };
 		97A84B3E8423857AD1C50112 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A66D9DB9127DEDE8721E9BE /* AppDelegate.swift */; };
+		A8C1D1B8579E43D6A3C7F611 /* MissionControlLabelController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8C1D1B7579E43D6A3C7F611 /* MissionControlLabelController.swift */; };
 		BA82B17C0220580D54A0DBF8 /* MenuBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CAAFB057C4C3E96E221CC4C /* MenuBarController.swift */; };
 		C9D43F846F93437E53FB4EF3 /* SpaceConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55A86475282498B1341AB719 /* SpaceConfig.swift */; };
 		E5D11B62A65E84F319B39C55 /* SpaceIdentifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E48F91A72EFD2AE9693FC90 /* SpaceIdentifier.swift */; };
@@ -34,6 +35,7 @@
 		5E48F91A72EFD2AE9693FC90 /* SpaceIdentifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceIdentifier.swift; sourceTree = "<group>"; };
 		683A0DFD101FE3C256FE669C /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		7CAAFB057C4C3E96E221CC4C /* MenuBarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarController.swift; sourceTree = "<group>"; };
+		A8C1D1B7579E43D6A3C7F611 /* MissionControlLabelController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MissionControlLabelController.swift; sourceTree = "<group>"; };
 		B3DF1EB730A2BC509CD80C2F /* DesktopTitle-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "DesktopTitle-Bridging-Header.h"; sourceTree = "<group>"; };
 		C8175982F31290F111A7AFBC /* DisplayConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayConfiguration.swift; sourceTree = "<group>"; };
 		D2992ED3E5A6FD7C511B73AB /* DebugLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLog.swift; sourceTree = "<group>"; };
@@ -46,6 +48,7 @@
 		00F8CC16EF822290911FD51A /* UI */ = {
 			isa = PBXGroup;
 			children = (
+				A8C1D1B7579E43D6A3C7F611 /* MissionControlLabelController.swift */,
 				7CAAFB057C4C3E96E221CC4C /* MenuBarController.swift */,
 				54810920380BA2B1C3D9B6AB /* OverlayView.swift */,
 				E537F6AB1A07EA0AE1B8173C /* OverlayWindow.swift */,
@@ -199,6 +202,7 @@
 				36CC0A8CF7194E4D2645480A /* DebugLog.swift in Sources */,
 				363F896806BE34E49279184E /* DisplayConfiguration.swift in Sources */,
 				BA82B17C0220580D54A0DBF8 /* MenuBarController.swift in Sources */,
+				A8C1D1B8579E43D6A3C7F611 /* MissionControlLabelController.swift in Sources */,
 				3B2E1C394EC6F06FFF140D76 /* OverlayView.swift in Sources */,
 				8B29D6971F27F9CF1CEA853C /* OverlayWindow.swift in Sources */,
 				F82FCFEF41999D640385D693 /* SettingsView.swift in Sources */,

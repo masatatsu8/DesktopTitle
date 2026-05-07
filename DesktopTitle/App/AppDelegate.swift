@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var shared: AppDelegate?
 
     private var menuBarController: MenuBarController?
+    private let missionControlLabelController = MissionControlLabelController()
     private var cancellables = Set<AnyCancellable>()
     private var overlayWindows: [String: OverlayWindow] = [:]
     private var overlayGenerations: [String: Int] = [:]
@@ -35,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Start monitoring space changes
         spaceMonitor.startMonitoring()
+        missionControlLabelController.start()
 
         // Subscribe to space changes
         spaceMonitor.$spaceChangeEvent
@@ -61,6 +63,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
+        spaceConfigManager.$configs
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.menuBarController?.updateCurrentSpace(self.spaceMonitor.currentSpace)
+                self.missionControlLabelController.refreshLabels()
+            }
+            .store(in: &cancellables)
+
+        settings.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.menuBarController?.updateCurrentSpace(self.spaceMonitor.currentSpace)
+                    self.missionControlLabelController.refreshLabels()
+                }
+            }
+            .store(in: &cancellables)
+
         // Initial sync
         spaceConfigManager.syncWithCurrentSpaces()
 
@@ -78,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         Self.shared = nil
         spaceConfigManager.syncWithCurrentSpaces()
+        missionControlLabelController.stop()
         spaceMonitor.stopMonitoring()
         displayConfigurationMonitor.stopMonitoring()
         DebugLog.log("AppDelegate", "DesktopTitle terminated")
@@ -86,6 +109,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Space Change Handling
 
     private func handleSpaceChange(_ event: SpaceChangeEvent) {
+        missionControlLabelController.hideImmediately(reason: "spaceChangeEvent")
+
         guard !event.changedSpaces.isEmpty else {
             DebugLog.log(
                 "AppDelegate",
@@ -321,6 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spaceMonitor.updateCurrentSpace()
         spaceConfigManager.syncWithCurrentSpaces()
         menuBarController?.updateCurrentSpace(spaceMonitor.currentSpace)
+        missionControlLabelController.refreshLabels()
     }
 }
 

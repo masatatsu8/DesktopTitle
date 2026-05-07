@@ -31,6 +31,9 @@ typedef enum {
 // Get the default connection to the window server
 CG_EXTERN CGSConnectionID _CGSDefaultConnection(void);
 
+// Get the main connection to the window server
+CG_EXTERN CGSConnectionID CGSMainConnectionID(void);
+
 // Get the ID of the currently active space
 CG_EXTERN CGSSpaceID CGSGetActiveSpace(CGSConnectionID cid);
 
@@ -43,7 +46,23 @@ CG_EXTERN CFArrayRef _Nullable CGSCopyManagedDisplaySpaces(CGSConnectionID cid) 
 // Copy spaces for the given space mask
 CG_EXTERN CFArrayRef _Nullable CGSCopySpaces(CGSConnectionID cid, CGSSpaceMask mask) CF_RETURNS_RETAINED;
 
+// Copy spaces containing the given windows
+CG_EXTERN CFArrayRef _Nullable CGSCopySpacesForWindows(CGSConnectionID cid, CGSSpaceMask mask, CFArrayRef _Nonnull windows) CF_RETURNS_RETAINED;
+
+// Assign windows to Spaces
+CG_EXTERN void CGSAddWindowsToSpaces(CGSConnectionID cid, CFArrayRef _Nonnull windows, CFArrayRef _Nonnull spaces);
+
+// Remove windows from Spaces
+CG_EXTERN void CGSRemoveWindowsFromSpaces(CGSConnectionID cid, CFArrayRef _Nonnull windows, CFArrayRef _Nonnull spaces);
+
 // Get display UUID for a space
 CG_EXTERN CFStringRef _Nullable CGSCopyManagedDisplayForSpace(CGSConnectionID cid, CGSSpaceID space) CF_RETURNS_RETAINED;
+
+// Register / unregister a callback for SkyLight (CGS) notifications.
+// `type` is one of the private CGSEvent* constants — there is no public
+// header for these, so callers register a range and log what fires.
+typedef void (*CGSNotifyProcPtr)(uint32_t type, void * _Nullable data, size_t length, void * _Nullable userInfo);
+CG_EXTERN CGError CGSRegisterNotifyProc(CGSNotifyProcPtr _Nonnull proc, uint32_t type, void * _Nullable userInfo);
+CG_EXTERN CGError CGSRemoveNotifyProc(CGSNotifyProcPtr _Nonnull proc, uint32_t type, void * _Nullable userInfo);
 
 #endif /* CGSPrivate_h */
