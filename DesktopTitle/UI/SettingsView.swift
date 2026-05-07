@@ -358,6 +358,7 @@ struct SettingsView: View {
         Form {
             Section {
                 Toggle("Launch at login", isOn: $settings.launchAtLogin)
+                Toggle("Show desktop name in menu bar", isOn: $settings.showMenuBarTitle)
                 Toggle("Show for fullscreen apps", isOn: $settings.showForFullscreen)
             } header: {
                 Text("Behavior")

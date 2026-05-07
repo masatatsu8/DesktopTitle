@@ -24,6 +24,9 @@ final class MenuBarController {
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "rectangle.split.3x1", accessibilityDescription: "DesktopTitle")
             button.image?.isTemplate = true
+            button.imagePosition = .imageLeading
+            button.font = .menuBarFont(ofSize: 0)
+            button.toolTip = "DesktopTitle"
         }
 
         setupMenu()
@@ -65,8 +68,22 @@ final class MenuBarController {
         if let space = spaceInfo {
             let name = SpaceConfigManager.shared.getDisplayName(for: space)
             currentItem.title = "Current: \(name)"
+            updateStatusButtonTitle(name)
         } else {
             currentItem.title = "Current: Unknown"
+            updateStatusButtonTitle(nil)
+        }
+    }
+
+    private func updateStatusButtonTitle(_ title: String?) {
+        guard let button = statusItem?.button else { return }
+
+        if AppSettings.shared.showMenuBarTitle, let title, !title.isEmpty {
+            button.title = " \(title)"
+            button.toolTip = "DesktopTitle: \(title)"
+        } else {
+            button.title = ""
+            button.toolTip = "DesktopTitle"
         }
     }
 
