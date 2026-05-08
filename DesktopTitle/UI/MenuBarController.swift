@@ -92,22 +92,33 @@ final class MenuBarController {
             let settingsView = SettingsView()
             let hostingController = NSHostingController(rootView: settingsView)
 
-            let window = NSWindow(contentViewController: hostingController)
-            window.title = "DesktopTitle Settings"
-            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-            window.setContentSize(NSSize(width: 480, height: 500))
-            window.minSize = NSSize(width: 400, height: 350)
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            window.center()
+            // Use an NSPanel with .nonactivatingPanel so opening / closing
+            // Settings does not toggle the app's activation state. As an
+            // LSUIElement menu-bar app, NSApp.activate followed by close
+            // forces macOS to pick a new "active" app, and that app's
+            // window can live on a different Space — causing the user's
+            // visible Space to jump when Settings closes.
+            let panel = NSPanel(contentViewController: hostingController)
+            panel.title = "DesktopTitle Settings"
+            panel.styleMask = [.titled, .closable, .miniaturizable, .resizable, .nonactivatingPanel]
+            panel.setContentSize(NSSize(width: 480, height: 500))
+            panel.minSize = NSSize(width: 400, height: 350)
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.isFloatingPanel = false
+            panel.becomesKeyOnlyIfNeeded = false
+            panel.hidesOnDeactivate = false
+            panel.isReleasedWhenClosed = false
+            panel.center()
 
-            settingsWindow = window
+            settingsWindow = panel
         }
 
-        // Ensure app is activated first, then make window key
-        NSApp.activate(ignoringOtherApps: true)
+        // Bring the panel to front and make it key for text input. We
+        // intentionally do NOT call NSApp.activate(ignoringOtherApps:);
+        // .nonactivatingPanel + makeKeyAndOrderFront is enough to take
+        // keyboard input without activating the whole app.
         settingsWindow?.makeKeyAndOrderFront(nil)
 
-        // Force the window to become key after a short delay (workaround for menu bar apps)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.settingsWindow?.makeKeyAndOrderFront(nil)
         }
