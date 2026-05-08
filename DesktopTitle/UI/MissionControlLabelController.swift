@@ -2,18 +2,27 @@
 //  MissionControlLabelController.swift
 //  DesktopTitle
 //
-//  Per-Space label windows that get captured into Mission Control's
-//  thumbnail strip and active-Space preview. Each banner is pinned to
-//  its Space via private CGS APIs and toggled between alpha=0 and
-//  alpha=1 based on whether Mission Control is currently active.
+//  Per-Space label windows pinned via private CGS APIs. While Mission
+//  Control is active each pinned banner becomes visible (alpha=1) so it
+//  appears inside its Space's MC live preview; the rest of the time
+//  every banner is alpha=0 so the user never sees them on the desktop.
 //
-//  Mission Control detection uses AXObserver on the Dock process. The
-//  MC overlay is rendered by SkyLight directly and is NOT exposed via
-//  CGWindowListCopyWindowInfo, NSWindow occlusion notifications, or
-//  the public `com.apple.expose.*` distributed notifications — every
-//  one of those was tried and discarded. AXObserver on Dock is the
-//  same mechanism Yabai / SpaceJump-style utilities use, and it does
-//  require Accessibility permission to be granted once.
+//  Detection uses two private SkyLight notification IDs observed on
+//  macOS 26 (Tahoe / 26.3.1):
+//
+//    • 1508 — fires once on MC open, twice (same millisecond) on MC
+//      close. We debounce within a 250 ms window, so each user toggle
+//      yields one effective event.
+//    • 1401 — active-Space change. Used both as the canonical Space
+//      switch signal AND to suppress phantom 1508s.
+//
+//  The crucial gotcha: macOS occasionally emits a stray 1508 about 1.2
+//  seconds BEFORE a Space switch (the "phantom 1508 → 1401" pattern).
+//  Treating that 1508 as MC-open would flash a giant banner during
+//  every Space switch — the original "大バナー during Space switch"
+//  bug. We defend against it by deferring activation by activationDelay
+//  (1.5 s); any 1401 that arrives in the meantime cancels the pending
+//  activation, so the banner never reaches the screen during a switch.
 //
 
 import AppKit
@@ -31,9 +40,17 @@ final class MissionControlLabelController {
     private var isMissionControlActive = false
     private var cgsMonitor: CGSEventMonitor?
     private var lastSpaceChangeAt: Date = .distantPast
-    private var lastDeactivatedAt: Date = .distantPast
     private var mcDeactivationTimer: Timer?
-    private var recentUnpaired1508s: [Date] = []
+    private var last1508At: Date = .distantPast
+    private var pendingActivationWork: DispatchWorkItem?
+
+    /// Delay between observing a 1508 (probable MC open) and actually showing
+    /// banners. macOS sometimes emits a phantom 1508 ~1.2s before a Space
+    /// switch (the "1508 then 1401" pattern that produces the "大バナー
+    /// during Space switch" bug). Holding off the visibility change for this
+    /// long lets a subsequent 1401 cancel the activation before any pixels
+    /// hit the screen.
+    private static let activationDelay: TimeInterval = 1.5
 
     static weak var shared: MissionControlLabelController?
 
@@ -67,56 +84,64 @@ final class MissionControlLabelController {
     fileprivate func handleCGSNotification(type: UInt32) {
         switch type {
         case 1401:
-            // Active Space changed. 1508 + 1401 fires in the same millisecond
-            // for both trackpad swipes AND in-MC navigation, so we cannot use
-            // 1401 to trigger MC; we only record the timestamp so a deferred-
-            // evaluated 1508 can detect "I'm just a Space-change side effect".
+            // Active Space changed. Record the timestamp so a deferred 1508
+            // evaluation can recognise "this 1508 is just a Space-change side
+            // effect". Also cancel any pending activation: a phantom 1508 ~1
+            // sec before this 1401 must NOT cause the banner to flash on
+            // screen during the switch animation. And if MC is already
+            // active, force it inactive — a Space change closes MC anyway
+            // (e.g., clicking a thumbnail to switch desktops).
             lastSpaceChangeAt = Date()
+            cancelPendingActivation(reason: "1401-spaceChange")
+            if isMissionControlActive {
+                deactivateMissionControl(reason: "1401-spaceChange")
+            }
         case 1508:
-            // Defer 100ms. 1508 races with 1401 inside the same millisecond
-            // when a Space switch happens; waiting lets the 1401 update
-            // lastSpaceChangeAt regardless of callback order.
+            // On macOS 26 (Tahoe / 26.3.1) MC open emits a single 1508 while
+            // MC close emits two 1508s within the same millisecond. Debounce
+            // them so each user-visible toggle counts once: ignore any 1508
+            // that arrives within 250ms of the previous one.
+            let now = Date()
+            let timeSinceLast1508 = now.timeIntervalSince(last1508At)
+            last1508At = now
+            if timeSinceLast1508 < 0.25 {
+                DebugLog.log("MissionControlLabel", "1508 debounced", details: [
+                    "deltaMs": "\(Int(timeSinceLast1508 * 1000))"
+                ])
+                return
+            }
+            // Defer 100ms so a paired 1401 (Space switch) has time to update
+            // lastSpaceChangeAt regardless of callback ordering.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 guard let self else { return }
-                let now = Date()
-                let timeSinceSpaceChange = now.timeIntervalSince(self.lastSpaceChangeAt)
+                let evalTime = Date()
+                let timeSinceSpaceChange = evalTime.timeIntervalSince(self.lastSpaceChangeAt)
                 if timeSinceSpaceChange < 0.3 {
                     DebugLog.log("MissionControlLabel", "1508 ignored (paired with 1401)", details: [
                         "deltaMs": "\(Int(timeSinceSpaceChange * 1000))"
                     ])
                     return
                 }
-                // 1507 fires AFTER the close-animation 1508s in CGS callback
-                // order, but my deferred 100ms check on those 1508s runs even
-                // later. Discard 1508s that arrive within 1s of an explicit
-                // 1507 deactivation — they are part of the close animation,
-                // not a fresh open.
-                let timeSinceDeactivation = now.timeIntervalSince(self.lastDeactivatedAt)
-                if timeSinceDeactivation < 1.0 {
-                    DebugLog.log("MissionControlLabel", "1508 ignored (post-1507 close)", details: [
-                        "deltaMs": "\(Int(timeSinceDeactivation * 1000))"
-                    ])
-                    return
+                if self.isMissionControlActive {
+                    self.deactivateMissionControl(reason: "1508-toggle")
+                } else if self.pendingActivationWork != nil {
+                    // A previous 1508 is still queued for delayed activation.
+                    // This new 1508 is therefore the close-pair (or an
+                    // open→close toggle within the activationDelay window).
+                    // Either way, cancel — net effect: no banner ever shows.
+                    self.cancelPendingActivation(reason: "1508-toggle close pair")
+                } else {
+                    // Schedule activation with a delay so a subsequent 1401
+                    // (Space change) can cancel it. See activationDelay docs.
+                    self.scheduleDelayedActivation(reason: "1508-toggle")
                 }
-                // Single isolated 1508s fire spuriously (e.g., ~3 sec after a
-                // trackpad swipe completes its animation). MC opens, by
-                // contrast, fire multiple 1508s within ~500ms. Require 2+ in
-                // the recent window before activating.
-                self.recentUnpaired1508s.append(now)
-                self.recentUnpaired1508s.removeAll { now.timeIntervalSince($0) > 0.5 }
-                guard self.recentUnpaired1508s.count >= 2 else {
-                    DebugLog.log("MissionControlLabel", "1508 buffered (need 2+)", details: [
-                        "count": "\(self.recentUnpaired1508s.count)"
-                    ])
-                    return
-                }
-                self.recentUnpaired1508s.removeAll()
-                self.activateMissionControl(reason: "1508-burst")
             }
         case 1507:
-            // 1507 fires reliably when Mission Control fully closes. Use it as
-            // the canonical deactivation signal.
-            deactivateMissionControl(reason: "1507")
+            // Some older macOS versions emit 1507 on MC close. Keep it as a
+            // belt-and-braces deactivation path.
+            if isMissionControlActive {
+                deactivateMissionControl(reason: "1507")
+            }
         default:
             break
         }
@@ -132,6 +157,30 @@ final class MissionControlLabelController {
         mcDeactivationTimer = timer
     }
 
+    private func scheduleDelayedActivation(reason: String) {
+        cancelPendingActivation(reason: "rescheduled")
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingActivationWork = nil
+            self.activateMissionControl(reason: "\(reason) (after \(Int(Self.activationDelay * 1000))ms)")
+        }
+        pendingActivationWork = work
+        DebugLog.log("MissionControlLabel", "scheduled delayed activation", details: [
+            "reason": reason,
+            "delayMs": "\(Int(Self.activationDelay * 1000))"
+        ])
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.activationDelay, execute: work)
+    }
+
+    private func cancelPendingActivation(reason: String) {
+        guard pendingActivationWork != nil else { return }
+        pendingActivationWork?.cancel()
+        pendingActivationWork = nil
+        DebugLog.log("MissionControlLabel", "cancelled pending activation", details: [
+            "reason": reason
+        ])
+    }
+
     private func activateMissionControl(reason: String) {
         rearmSafetyTimer()
         if !isMissionControlActive {
@@ -141,12 +190,9 @@ final class MissionControlLabelController {
     }
 
     private func deactivateMissionControl(reason: String) {
+        cancelPendingActivation(reason: "deactivate")
         mcDeactivationTimer?.invalidate()
         mcDeactivationTimer = nil
-        // Drop any pending 1508 burst tracking — the close animation
-        // produces 1508s and we must not let them re-trigger activation.
-        recentUnpaired1508s.removeAll()
-        lastDeactivatedAt = Date()
         if isMissionControlActive {
             isMissionControlActive = false
             applyVisibility(reason: "mc deactivate (\(reason))")
@@ -154,6 +200,10 @@ final class MissionControlLabelController {
     }
 
     func stop() {
+        cancelPendingActivation(reason: "stop")
+        mcDeactivationTimer?.invalidate()
+        mcDeactivationTimer = nil
+
         for observer in workspaceObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
@@ -232,25 +282,23 @@ final class MissionControlLabelController {
     // MARK: - Visibility toggle
 
     /// Strategy:
-    ///   - Mission Control NOT active: every banner is alpha=0.
-    ///   - Mission Control active: every non-active-Space banner is alpha=1
-    ///     so it appears in MC's thumbnail strip; the active-Space banner
-    ///     stays at alpha=0 so it does not appear over the live preview
-    ///     (mirrors SpaceJump's observed behavior — the highlighted Space's
-    ///     thumbnail has no banner).
+    ///   - Mission Control NOT active: every banner is alpha=0 — the user
+    ///     never sees the banner during normal desktop work.
+    ///   - Mission Control active: every banner is alpha=1, including the
+    ///     active Space's. macOS 26 (Tahoe) MC keeps the active Space's
+    ///     content visible in the main MC area, so showing the banner there
+    ///     gives the user a visible name for the focused Space.
     private func applyVisibility(reason: String) {
         let activeSpaceID = spaceIdentifier.getActiveSpaceID()
 
-        for (spaceID, window) in windows {
+        for (_, window) in windows {
             let target: CGFloat
             if Self.debugAlwaysVisible {
                 target = 1
-            } else if !isMissionControlActive {
-                target = 0
-            } else if spaceID == activeSpaceID {
-                target = 0
-            } else {
+            } else if isMissionControlActive {
                 target = 1
+            } else {
+                target = 0
             }
             window.alphaValue = target
         }
@@ -264,27 +312,18 @@ final class MissionControlLabelController {
     }
 }
 
-// MARK: - CGS notification monitor (diagnostic)
+// MARK: - CGS notification monitor
 
-/// Registers callbacks for a wide range of private SkyLight notification
-/// type IDs and logs everything that fires. The MC-related IDs are not
-/// publicly documented, so this is exploratory: open MC, swipe Spaces,
-/// etc., then look at the log to see which IDs fire when.
+/// Registers callbacks for the SkyLight notification IDs we actually act
+/// on. The IDs themselves are not publicly documented, so what each one
+/// signals was determined empirically on macOS 26 (Tahoe / 26.3.1):
+///   • 1401 — active Space changed.
+///   • 1507 — Mission Control fully closed (legacy-macOS deactivation
+///     path; Tahoe rarely emits it but the handler stays for safety).
+///   • 1508 — Mission Control toggle (single fire on open, paired on
+///     close).
 private final class CGSEventMonitor {
-    private static let candidateTypeIDs: [UInt32] = [
-        // Window / process foreground
-        100, 101, 102, 103, 104, 105,
-        // Space switching family
-        1100, 1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110,
-        // Mission Control / Exposé family (Yabai uses values in this range)
-        1200, 1201, 1202, 1203, 1204,
-        1400, 1401, 1402, 1403, 1404, 1405, 1406, 1407, 1408,
-        1409, 1410, 1411, 1412, 1413, 1414, 1415, 1416, 1417, 1418, 1419,
-        // Space / display change family
-        1500, 1501, 1502, 1503, 1504, 1505, 1506, 1507, 1508, 1509, 1510,
-        // Dock / Launchpad
-        1600, 1601, 1602, 1603, 1604, 1605, 1606,
-    ]
+    private static let candidateTypeIDs: [UInt32] = [1401, 1507, 1508]
 
     private var registered: [UInt32] = []
 
@@ -366,9 +405,16 @@ private final class MissionControlLabelWindow: NSWindow {
         isExcludedFromWindowsMenu = true
         isReleasedWhenClosed = false
         alphaValue = 0
+        // Use .normal so the window participates in normal compositing —
+        // higher levels (.floating / .screenSaver) appear to be filtered
+        // out of Mission Control's thumbnail compositor on macOS Tahoe.
         level = .normal
-        sharingType = .readOnly
-        collectionBehavior = [.fullScreenAuxiliary]
+        // Default sharing type allows screen capture and MC compositing.
+        sharingType = .readWrite
+        // No special collection behavior — pinning is handled explicitly via
+        // CGSAddWindowsToSpaces, and we want the window treated like any
+        // other user window for MC capture purposes.
+        collectionBehavior = []
     }
 
     func update(space: SpaceInfo) {
