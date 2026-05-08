@@ -186,6 +186,7 @@ final class MissionControlLabelController {
         if !isMissionControlActive {
             isMissionControlActive = true
             applyVisibility(reason: "mc activate (\(reason))")
+            raiseNonActiveBanners()
         }
     }
 
@@ -289,12 +290,13 @@ final class MissionControlLabelController {
     ///     active Space's banner is alpha=1 only when the user has
     ///     opted-in via showMissionControlLabelOnActiveSpace; otherwise
     ///     it stays hidden so the live preview is uncovered.
-    ///   - Each visible non-active banner is also raised in z-order so it
-    ///     wins against user app windows on its pinned Space — without
-    ///     this, an app filling the desktop hides the banner inside its
-    ///     thumbnail. The active banner is intentionally NOT raised: a
-    ///     CGS reorder on the previously-active Space's banner triggers
-    ///     a "bounce-back" when the user clicks an MC thumbnail to switch.
+    ///   - z-order raise is intentionally NOT done here. It is performed
+    ///     exactly once per activation (see activateMissionControl) so it
+    ///     cannot fire during a Space-change race (NSWorkspace's
+    ///     activeSpaceDidChangeNotification can run BEFORE the 1401
+    ///     deactivation; raising the previously-active Space's banner in
+    ///     that window triggers macOS bounce-back on thumbnail-click
+    ///     Space switches).
     private func applyVisibility(reason: String) {
         let activeSpaceID = spaceIdentifier.getActiveSpaceID()
         let showOnActive = settings.showMissionControlLabelOnActiveSpace
@@ -311,14 +313,6 @@ final class MissionControlLabelController {
                 target = 1
             }
             window.alphaValue = target
-
-            // Raise non-active banners so they sit above any user windows
-            // that happen to be open on those Spaces. We never raise the
-            // active Space's banner — doing so causes the OS to bounce
-            // focus back to it after a thumbnail-click Space switch.
-            if target > 0 && spaceID != activeSpaceID {
-                window.raiseInZOrder()
-            }
         }
 
         DebugLog.log("MissionControlLabel", "applied visibility", details: [
@@ -328,6 +322,18 @@ final class MissionControlLabelController {
             "showOnActive": "\(showOnActive)",
             "windowCount": "\(windows.count)"
         ])
+    }
+
+    /// Raises every non-active Space's banner once on MC activation so
+    /// they win against user app windows in the MC thumbnail composite.
+    /// We deliberately do NOT raise on every applyVisibility — a raise
+    /// triggered during a thumbnail-click Space-change race causes macOS
+    /// to bounce focus back to the originating Space.
+    private func raiseNonActiveBanners() {
+        let activeSpaceID = spaceIdentifier.getActiveSpaceID()
+        for (spaceID, window) in windows where spaceID != activeSpaceID {
+            window.raiseInZOrder()
+        }
     }
 }
 
