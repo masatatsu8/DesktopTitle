@@ -106,6 +106,14 @@ final class MissionControlLabelController {
             // Just refresh visibility so the new active Space is reflected.
             lastSpaceChangeAt = Date()
             cancelPendingActivation(reason: "1401-spaceChange")
+            // If 1508s have already arrived for this same instant, this is
+            // a click-thumbnail close (1508+1401 fire together). Hide the
+            // banners synchronously so they vanish before the MC zoom-in
+            // animation starts — otherwise the user sees the banner zoom
+            // into view on the destination Space.
+            if isMissionControlActive && !pending1508s.isEmpty {
+                hideAllBannersImmediately(reason: "1401-with-pending-1508")
+            }
             if isMissionControlActive {
                 applyVisibility(reason: "1401-spaceChange")
             }
@@ -117,7 +125,14 @@ final class MissionControlLabelController {
             // event means MC open. Forcing the resulting state, rather
             // than toggling, makes the controller self-healing if state
             // ever desyncs (e.g., MC closing while DesktopTitle was paused).
-            pending1508s.append(Date())
+            let now = Date()
+            pending1508s.append(now)
+            // If a 1401 fired within the last 50 ms, this 1508 is part of a
+            // click-thumbnail close pulse. Hide banners synchronously now
+            // so they don't show during the destination Space's zoom-in.
+            if isMissionControlActive && now.timeIntervalSince(lastSpaceChangeAt) < 0.05 {
+                hideAllBannersImmediately(reason: "1508-with-recent-1401")
+            }
             if pending1508EvalWork == nil {
                 let work = DispatchWorkItem { [weak self] in
                     self?.classify1508Burst()
@@ -137,6 +152,20 @@ final class MissionControlLabelController {
         default:
             break
         }
+    }
+
+    /// Synchronously force every banner to alpha=0. Used as the fast
+    /// hide-path for click-thumbnail closes: the burst classifier needs
+    /// 30 ms to confirm "this is a close", but the user's MC zoom-in
+    /// animation starts immediately, so we must drop the banners before
+    /// the zoom captures them.
+    private func hideAllBannersImmediately(reason: String) {
+        for window in windows.values {
+            window.alphaValue = 0
+        }
+        DebugLog.log("MissionControlLabel", "hideAllBannersImmediately", details: [
+            "reason": reason
+        ])
     }
 
     /// Classifies the buffered 1508 burst that just expired its window.
@@ -180,9 +209,11 @@ final class MissionControlLabelController {
         if isMissionControlActive {
             // Already active and a single 1508 arrived without a paired
             // partner. macOS occasionally emits a 1508 mid-MC for other
-            // reasons; do not treat it as a toggle. Re-schedule activation
-            // is unnecessary — state already matches.
-            DebugLog.log("MissionControlLabel", "1508 single while active (no-op)", details: [:])
+            // reasons; do not treat it as a toggle. We may have hidden
+            // banners early via hideAllBannersImmediately if a 1401 was
+            // recent, so re-apply visibility to restore them.
+            DebugLog.log("MissionControlLabel", "1508 single while active → restore", details: [:])
+            applyVisibility(reason: "1508-single restore")
         } else {
             scheduleDelayedActivation(reason: "1508-open")
         }
