@@ -41,8 +41,17 @@ final class MissionControlLabelController {
     private var cgsMonitor: CGSEventMonitor?
     private var lastSpaceChangeAt: Date = .distantPast
     private var mcDeactivationTimer: Timer?
-    private var last1508At: Date = .distantPast
     private var pendingActivationWork: DispatchWorkItem?
+    private var pending1508s: [Date] = []
+    private var pending1508EvalWork: DispatchWorkItem?
+
+    /// Window during which we coalesce 1508 events to classify them.
+    /// Empirically on macOS Tahoe (26.3.1):
+    ///   • MC open: emits 1 single 1508 (sometimes 2 with ~165 ms gap).
+    ///   • MC close: emits 2 paired 1508s within the SAME millisecond.
+    /// 30 ms catches the same-ms pair without merging the 165 ms-spaced
+    /// open pair, letting us classify the burst as open vs close.
+    private static let pulseClassificationWindow: TimeInterval = 0.03
 
     /// Delay between observing a 1508 (probable MC open) and actually showing
     /// banners. macOS sometimes emits a phantom 1508 ~1.2s before a Space
@@ -101,56 +110,23 @@ final class MissionControlLabelController {
                 applyVisibility(reason: "1401-spaceChange")
             }
         case 1508:
-            // On macOS 26 (Tahoe / 26.3.1) MC open emits a single 1508 while
-            // MC close emits two 1508s within the same millisecond. Debounce
-            // them so each user-visible toggle counts once: ignore any 1508
-            // that arrives within 250ms of the previous one.
-            let now = Date()
-            let timeSinceLast1508 = now.timeIntervalSince(last1508At)
-            last1508At = now
-            if timeSinceLast1508 < 0.25 {
-                DebugLog.log("MissionControlLabel", "1508 debounced", details: [
-                    "deltaMs": "\(Int(timeSinceLast1508 * 1000))"
-                ])
-                return
-            }
-            // Defer 100ms so a paired 1401 (Space switch) has time to update
-            // lastSpaceChangeAt regardless of callback ordering.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                guard let self else { return }
-                let evalTime = Date()
-                let timeSinceSpaceChange = evalTime.timeIntervalSince(self.lastSpaceChangeAt)
-                if timeSinceSpaceChange < 0.3 {
-                    // 1508 arrived alongside a 1401. Two interpretations:
-                    //   • Ctrl+←/→ outside MC — phantom 1508 + 1401 — no
-                    //     state change needed (no MC activity).
-                    //   • Click-thumbnail in MC — paired 1508 close pulse
-                    //     after 1401 — MC is closing, so deactivate.
-                    if self.isMissionControlActive {
-                        DebugLog.log("MissionControlLabel", "1508 paired with 1401 → MC close", details: [
-                            "deltaMs": "\(Int(timeSinceSpaceChange * 1000))"
-                        ])
-                        self.deactivateMissionControl(reason: "1508-paired-with-1401")
-                    } else {
-                        DebugLog.log("MissionControlLabel", "1508 ignored (paired with 1401)", details: [
-                            "deltaMs": "\(Int(timeSinceSpaceChange * 1000))"
-                        ])
-                    }
-                    return
+            // Buffer all 1508 events that arrive within
+            // pulseClassificationWindow, then classify the burst by COUNT —
+            // not by toggling state (which drifts). Two events in the same
+            // window means MC close (paired same-ms pulse). One isolated
+            // event means MC open. Forcing the resulting state, rather
+            // than toggling, makes the controller self-healing if state
+            // ever desyncs (e.g., MC closing while DesktopTitle was paused).
+            pending1508s.append(Date())
+            if pending1508EvalWork == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    self?.classify1508Burst()
                 }
-                if self.isMissionControlActive {
-                    self.deactivateMissionControl(reason: "1508-toggle")
-                } else if self.pendingActivationWork != nil {
-                    // A previous 1508 is still queued for delayed activation.
-                    // This new 1508 is therefore the close-pair (or an
-                    // open→close toggle within the activationDelay window).
-                    // Either way, cancel — net effect: no banner ever shows.
-                    self.cancelPendingActivation(reason: "1508-toggle close pair")
-                } else {
-                    // Schedule activation with a delay so a subsequent 1401
-                    // (Space change) can cancel it. See activationDelay docs.
-                    self.scheduleDelayedActivation(reason: "1508-toggle")
-                }
+                pending1508EvalWork = work
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + Self.pulseClassificationWindow,
+                    execute: work
+                )
             }
         case 1507:
             // Some older macOS versions emit 1507 on MC close. Keep it as a
@@ -160,6 +136,55 @@ final class MissionControlLabelController {
             }
         default:
             break
+        }
+    }
+
+    /// Classifies the buffered 1508 burst that just expired its window.
+    /// Two-or-more events in the burst means MC closed (paired pulse);
+    /// a single event means MC opened. We force the resulting state
+    /// directly rather than toggle so a desynced state can self-heal.
+    private func classify1508Burst() {
+        let events = pending1508s
+        pending1508s.removeAll()
+        pending1508EvalWork = nil
+
+        let now = Date()
+        let timeSinceSpaceChange = now.timeIntervalSince(lastSpaceChangeAt)
+        let count = events.count
+
+        if count >= 2 {
+            // Same-ms paired 1508 → MC CLOSE. Force state inactive.
+            DebugLog.log("MissionControlLabel", "1508 burst → MC close", details: [
+                "count": "\(count)",
+                "wasActive": "\(isMissionControlActive)"
+            ])
+            cancelPendingActivation(reason: "1508-close")
+            if isMissionControlActive {
+                deactivateMissionControl(reason: "1508-close")
+            }
+            return
+        }
+
+        // Single 1508 — MC OPEN signal, OR phantom-from-Ctrl-arrow.
+        if timeSinceSpaceChange < 0.3 {
+            // Phantom 1508 from a Space switch; ignore.
+            DebugLog.log("MissionControlLabel", "1508 ignored (paired with 1401)", details: [
+                "deltaMs": "\(Int(timeSinceSpaceChange * 1000))"
+            ])
+            return
+        }
+
+        // Wait briefly to see if a 1401 follows (phantom→space-switch
+        // pattern). scheduleDelayedActivation already builds in the 1.5 s
+        // wait that lets a subsequent 1401 cancel us.
+        if isMissionControlActive {
+            // Already active and a single 1508 arrived without a paired
+            // partner. macOS occasionally emits a 1508 mid-MC for other
+            // reasons; do not treat it as a toggle. Re-schedule activation
+            // is unnecessary — state already matches.
+            DebugLog.log("MissionControlLabel", "1508 single while active (no-op)", details: [:])
+        } else {
+            scheduleDelayedActivation(reason: "1508-open")
         }
     }
 
@@ -233,6 +258,9 @@ final class MissionControlLabelController {
 
     func stop() {
         cancelPendingActivation(reason: "stop")
+        pending1508EvalWork?.cancel()
+        pending1508EvalWork = nil
+        pending1508s.removeAll()
         mcDeactivationTimer?.invalidate()
         mcDeactivationTimer = nil
 
