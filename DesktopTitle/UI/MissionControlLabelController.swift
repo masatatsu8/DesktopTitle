@@ -284,10 +284,11 @@ final class MissionControlLabelController {
     /// Strategy:
     ///   - Mission Control NOT active: every banner is alpha=0 — the user
     ///     never sees the banner during normal desktop work.
-    ///   - Mission Control active: every banner is alpha=1, including the
-    ///     active Space's. macOS 26 (Tahoe) MC keeps the active Space's
-    ///     content visible in the main MC area, so showing the banner there
-    ///     gives the user a visible name for the focused Space.
+    ///   - Mission Control active: every NON-active Space's banner is
+    ///     alpha=1 so it shows up inside that Space's thumbnail, while the
+    ///     active Space's banner stays alpha=0. The user is already on the
+    ///     active Space and the live preview area shows their actual
+    ///     content; covering it with a giant banner is noise.
     private func applyVisibility(reason: String) {
         let activeSpaceID = spaceIdentifier.getActiveSpaceID()
 
@@ -295,23 +296,14 @@ final class MissionControlLabelController {
             let target: CGFloat
             if Self.debugAlwaysVisible {
                 target = 1
-            } else if isMissionControlActive {
-                target = 1
-            } else {
+            } else if !isMissionControlActive {
                 target = 0
+            } else if spaceID == activeSpaceID {
+                target = 0
+            } else {
+                target = 1
             }
             window.alphaValue = target
-
-            // Raise ONLY the active Space's banner above same-level user
-            // windows. Calling CGSOrderWindow on banners pinned to other
-            // Spaces makes macOS bounce focus back to the originating
-            // Space when the user clicks an MC thumbnail to switch — the
-            // raise on the previously-active Space's banner pulls the OS
-            // back. Limiting raise to the active Space preserves on-top
-            // rendering for the live MC preview without the bounce-back.
-            if target > 0 && spaceID == activeSpaceID {
-                window.raiseInZOrder()
-            }
         }
 
         DebugLog.log("MissionControlLabel", "applied visibility", details: [
@@ -474,17 +466,6 @@ private final class MissionControlLabelWindow: NSWindow {
         hosting.frame = NSRect(origin: .zero, size: frame.size)
         hosting.autoresizingMask = [.width, .height]
         contentView = hosting
-    }
-
-    /// Raises the window above other same-level windows on its pinned Space
-    /// without changing its NSWindow level (changing the level would break
-    /// per-Space pinning on macOS Tahoe). Call this whenever the banner
-    /// should win against user app windows in the MC thumbnail.
-    func raiseInZOrder() {
-        guard windowNumber > 0 else { return }
-        let connection = CGSMainConnectionID()
-        // place=1 (kCGSOrderAbove), relative=0 → above the entire stack.
-        _ = CGSOrderWindow(connection, Int32(windowNumber), 1, 0)
     }
 
     private func pinToAssignedSpace() {
