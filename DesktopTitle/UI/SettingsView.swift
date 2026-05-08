@@ -360,6 +360,8 @@ struct SettingsView: View {
                 Toggle("Launch at login", isOn: $settings.launchAtLogin)
                 Toggle("Show desktop name in menu bar", isOn: $settings.showMenuBarTitle)
                 Toggle("Show labels in Mission Control", isOn: $settings.showMissionControlLabels)
+                Toggle("Also label the active desktop in Mission Control", isOn: $settings.showMissionControlLabelOnActiveSpace)
+                    .disabled(!settings.showMissionControlLabels)
                 Toggle("Show for fullscreen apps", isOn: $settings.showForFullscreen)
             } header: {
                 Text("Behavior")
