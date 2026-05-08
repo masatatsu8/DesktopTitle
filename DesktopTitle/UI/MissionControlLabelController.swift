@@ -572,8 +572,20 @@ private final class MissionControlLabelWindow: NSWindow {
 
         let connection = CGSMainConnectionID()
         let windowIDs = [NSNumber(value: Int32(windowNumber))] as CFArray
-        let targetSpaces = [NSNumber(value: pinnedSpaceID)] as CFArray
 
+        // Fast path: skip CGS pin operations entirely if the window is
+        // already pinned exclusively to its target Space. Re-running
+        // CGSAddWindowsToSpaces / CGSRemoveWindowsFromSpaces on every
+        // settings tick can drag the user's active Space when the bursts
+        // are large (e.g. dragging a color slider in Settings).
+        if let currentSpaces = CGSCopySpacesForWindows(connection, kCGSAllSpacesMask, windowIDs) {
+            let currentIDs = (currentSpaces as NSArray).compactMap { ($0 as? NSNumber)?.uint64Value }
+            if currentIDs == [pinnedSpaceID] {
+                return
+            }
+        }
+
+        let targetSpaces = [NSNumber(value: pinnedSpaceID)] as CFArray
         CGSAddWindowsToSpaces(connection, windowIDs, targetSpaces)
 
         if let currentSpaces = CGSCopySpacesForWindows(connection, kCGSAllSpacesMask, windowIDs) {

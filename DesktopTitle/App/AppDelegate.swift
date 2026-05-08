@@ -63,8 +63,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
+        // Debounce reactive label rebuilds. Each rebuild iterates all 11
+        // banner windows and re-runs SwiftUI hosting + CGS pin operations,
+        // which is expensive AND occasionally drags the user's active
+        // Space when the burst is large (e.g. while scrubbing a color
+        // picker in Settings). 120 ms catches sustained slider drags
+        // without making single edits feel sluggish.
         spaceConfigManager.$configs
-            .receive(on: RunLoop.main)
+            .debounce(for: .milliseconds(120), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self else { return }
                 self.menuBarController?.updateCurrentSpace(self.spaceMonitor.currentSpace)
@@ -73,13 +79,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         settings.objectWillChange
-            .receive(on: RunLoop.main)
+            .debounce(for: .milliseconds(120), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.menuBarController?.updateCurrentSpace(self.spaceMonitor.currentSpace)
-                    self.missionControlLabelController.refreshLabels()
-                }
+                guard let self else { return }
+                self.menuBarController?.updateCurrentSpace(self.spaceMonitor.currentSpace)
+                self.missionControlLabelController.refreshLabels()
             }
             .store(in: &cancellables)
 
