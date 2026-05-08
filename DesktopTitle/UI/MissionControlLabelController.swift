@@ -301,6 +301,14 @@ final class MissionControlLabelController {
                 target = 0
             }
             window.alphaValue = target
+
+            // When making the banner visible, raise it above same-level
+            // user windows on its pinned Space so it is not occluded in
+            // the Mission Control thumbnail. The CGS-level reorder does
+            // NOT switch Spaces (NSWindow.orderFront would).
+            if target > 0 {
+                window.raiseInZOrder()
+            }
         }
 
         DebugLog.log("MissionControlLabel", "applied visibility", details: [
@@ -405,15 +413,16 @@ private final class MissionControlLabelWindow: NSWindow {
         isExcludedFromWindowsMenu = true
         isReleasedWhenClosed = false
         alphaValue = 0
-        // Use .normal so the window participates in normal compositing —
-        // higher levels (.floating / .screenSaver) appear to be filtered
-        // out of Mission Control's thumbnail compositor on macOS Tahoe.
+        // Stay at .normal so per-Space pinning enforced via
+        // CGSAddWindowsToSpaces is honoured — any higher level (even +1)
+        // makes macOS treat the window as system-level and breaks the pin,
+        // causing the banner to leak onto the active Space. Trade-off: at
+        // .normal, user app windows on the same Space CAN occlude the
+        // banner in the MC thumbnail. We mitigate by keeping the banner
+        // large (88×41% of the Space) so partial occlusion still shows
+        // enough of the label to read.
         level = .normal
-        // Default sharing type allows screen capture and MC compositing.
         sharingType = .readWrite
-        // No special collection behavior — pinning is handled explicitly via
-        // CGSAddWindowsToSpaces, and we want the window treated like any
-        // other user window for MC capture purposes.
         collectionBehavior = []
     }
 
@@ -462,6 +471,17 @@ private final class MissionControlLabelWindow: NSWindow {
         hosting.frame = NSRect(origin: .zero, size: frame.size)
         hosting.autoresizingMask = [.width, .height]
         contentView = hosting
+    }
+
+    /// Raises the window above other same-level windows on its pinned Space
+    /// without changing its NSWindow level (changing the level would break
+    /// per-Space pinning on macOS Tahoe). Call this whenever the banner
+    /// should win against user app windows in the MC thumbnail.
+    func raiseInZOrder() {
+        guard windowNumber > 0 else { return }
+        let connection = CGSMainConnectionID()
+        // place=1 (kCGSOrderAbove), relative=0 → above the entire stack.
+        _ = CGSOrderWindow(connection, Int32(windowNumber), 1, 0)
     }
 
     private func pinToAssignedSpace() {

@@ -65,4 +65,12 @@ typedef void (*CGSNotifyProcPtr)(uint32_t type, void * _Nullable data, size_t le
 CG_EXTERN CGError CGSRegisterNotifyProc(CGSNotifyProcPtr _Nonnull proc, uint32_t type, void * _Nullable userInfo);
 CG_EXTERN CGError CGSRemoveNotifyProc(CGSNotifyProcPtr _Nonnull proc, uint32_t type, void * _Nullable userInfo);
 
+// Reorder a window in its Space's z-stack without forcing a Space switch.
+// `place` follows the kCGSOrder* constants: 0 below, 1 above.
+// `relative` is the windowID we order relative to, or 0 to mean "the entire
+// stack". This lets us raise the banner above same-level user windows so
+// it is not occluded in the Mission Control thumbnail, while leaving
+// NSWindow.level at .normal (higher levels break per-Space pinning).
+CG_EXTERN CGError CGSOrderWindow(CGSConnectionID cid, int windowID, int place, int relative);
+
 #endif /* CGSPrivate_h */
