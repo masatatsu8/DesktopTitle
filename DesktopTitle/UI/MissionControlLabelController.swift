@@ -202,6 +202,16 @@ final class MissionControlLabelController {
         if !isMissionControlActive {
             isMissionControlActive = true
             applyVisibility(reason: "mc activate (\(reason))")
+            // Raise non-active banners above same-level user windows so
+            // they aren't occluded inside their MC thumbnails. Doing this
+            // here (once on activation) and lowering them on deactivation
+            // keeps the z-state clean — repeating the raise on every
+            // applyVisibility caused MC bounce-back / multi-skip in
+            // earlier iterations.
+            let activeID = spaceIdentifier.getActiveSpaceID()
+            for (spaceID, window) in windows where spaceID != activeID {
+                window.raiseInZOrder()
+            }
         }
     }
 
@@ -212,6 +222,12 @@ final class MissionControlLabelController {
         if isMissionControlActive {
             isMissionControlActive = false
             applyVisibility(reason: "mc deactivate (\(reason))")
+            // Lower the banners so the previous raise does not linger as
+            // a "remembered" top-of-stack request that could pull macOS
+            // back to the originating Space on subsequent navigation.
+            for window in windows.values {
+                window.lowerInZOrder()
+            }
         }
     }
 
@@ -499,6 +515,25 @@ private final class MissionControlLabelWindow: NSWindow {
         hosting.frame = NSRect(origin: .zero, size: frame.size)
         hosting.autoresizingMask = [.width, .height]
         contentView = hosting
+    }
+
+    /// Raises this banner above same-level user windows on its pinned
+    /// Space without changing NSWindow.level. The CGS reorder does NOT
+    /// switch Spaces.
+    func raiseInZOrder() {
+        guard windowNumber > 0 else { return }
+        let connection = CGSMainConnectionID()
+        // place=1 (kCGSOrderAbove), relative=0 → above the entire stack.
+        _ = CGSOrderWindow(connection, Int32(windowNumber), 1, 0)
+    }
+
+    /// Lowers this banner so subsequent raise side effects do not linger
+    /// once MC closes (see deactivateMissionControl cleanup).
+    func lowerInZOrder() {
+        guard windowNumber > 0 else { return }
+        let connection = CGSMainConnectionID()
+        // place=0 (kCGSOrderBelow), relative=0 → below the entire stack.
+        _ = CGSOrderWindow(connection, Int32(windowNumber), 0, 0)
     }
 
     private func pinToAssignedSpace() {
