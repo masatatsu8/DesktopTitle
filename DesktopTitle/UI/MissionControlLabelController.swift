@@ -39,11 +39,18 @@ final class MissionControlLabelController {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var isMissionControlActive = false
     private var cgsMonitor: CGSEventMonitor?
+    private var globalMouseMonitor: Any?
     private var lastSpaceChangeAt: Date = .distantPast
     private var mcDeactivationTimer: Timer?
     private var pendingActivationWork: DispatchWorkItem?
     private var pending1508s: [Date] = []
     private var pending1508EvalWork: DispatchWorkItem?
+
+    /// Height (in points) of the MC thumbnail strip / target click region.
+    /// A mouse-down inside this band while MC is active is treated as a
+    /// thumbnail click, prompting an immediate banner hide so the
+    /// destination Space's zoom-in animation does not include the banner.
+    private static let mcStripHeight: CGFloat = 200
 
     /// Window during which we coalesce 1508 events to classify them.
     /// Empirically on macOS Tahoe (26.3.1):
@@ -84,10 +91,33 @@ final class MissionControlLabelController {
         monitor.start()
         cgsMonitor = monitor
 
+        // Global mouse-down monitor. CGS Space-change events arrive a few
+        // ms AFTER macOS has already begun the destination thumbnail's
+        // zoom-in animation, so the banner is captured in the first few
+        // frames. Reacting to the mouse-down itself lets us hide the
+        // banners ~50–100 ms before the click registers as a Space switch.
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            self?.handleGlobalMouseDown(event)
+        }
+
         DebugLog.log("MissionControlLabel", "started", details: [
             "windowCount": "\(windows.count)",
             "debugAlwaysVisible": "\(Self.debugAlwaysVisible)"
         ])
+    }
+
+    private func handleGlobalMouseDown(_ event: NSEvent) {
+        guard isMissionControlActive else { return }
+        // NSEvent.mouseLocation gives screen coordinates with origin at the
+        // bottom-left of the primary display. The MC thumbnail strip sits
+        // at the TOP of the screen — a mouse-down up there during MC is
+        // very likely a thumbnail click.
+        let location = NSEvent.mouseLocation
+        guard let mainScreen = NSScreen.main else { return }
+        let topY = mainScreen.frame.maxY
+        if location.y >= topY - Self.mcStripHeight {
+            hideAllBannersImmediately(reason: "mouseDown-in-mc-strip y=\(Int(location.y)) topY=\(Int(topY))")
+        }
     }
 
     fileprivate func handleCGSNotification(type: UInt32) {
@@ -305,6 +335,11 @@ final class MissionControlLabelController {
 
         cgsMonitor?.stop()
         cgsMonitor = nil
+
+        if let monitor = globalMouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalMouseMonitor = nil
+        }
 
         for window in windows.values {
             window.close()
