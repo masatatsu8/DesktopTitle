@@ -86,15 +86,19 @@ final class MissionControlLabelController {
         case 1401:
             // Active Space changed. Record the timestamp so a deferred 1508
             // evaluation can recognise "this 1508 is just a Space-change side
-            // effect". Also cancel any pending activation: a phantom 1508 ~1
-            // sec before this 1401 must NOT cause the banner to flash on
-            // screen during the switch animation. And if MC is already
-            // active, force it inactive — a Space change closes MC anyway
-            // (e.g., clicking a thumbnail to switch desktops).
+            // effect". Cancel any pending activation: a phantom 1508 ~1 sec
+            // before this 1401 must NOT cause the banner to flash on screen
+            // during the switch animation.
+            //
+            // Do NOT deactivate MC here. In-MC navigation (Ctrl+←/→ while
+            // MC is open) fires 1401 alone — MC stays open. Click-thumbnail
+            // also fires 1401 but is followed by a paired 1508 close pulse;
+            // the 1508 handler is responsible for closing MC in that case.
+            // Just refresh visibility so the new active Space is reflected.
             lastSpaceChangeAt = Date()
             cancelPendingActivation(reason: "1401-spaceChange")
             if isMissionControlActive {
-                deactivateMissionControl(reason: "1401-spaceChange")
+                applyVisibility(reason: "1401-spaceChange")
             }
         case 1508:
             // On macOS 26 (Tahoe / 26.3.1) MC open emits a single 1508 while
@@ -117,9 +121,21 @@ final class MissionControlLabelController {
                 let evalTime = Date()
                 let timeSinceSpaceChange = evalTime.timeIntervalSince(self.lastSpaceChangeAt)
                 if timeSinceSpaceChange < 0.3 {
-                    DebugLog.log("MissionControlLabel", "1508 ignored (paired with 1401)", details: [
-                        "deltaMs": "\(Int(timeSinceSpaceChange * 1000))"
-                    ])
+                    // 1508 arrived alongside a 1401. Two interpretations:
+                    //   • Ctrl+←/→ outside MC — phantom 1508 + 1401 — no
+                    //     state change needed (no MC activity).
+                    //   • Click-thumbnail in MC — paired 1508 close pulse
+                    //     after 1401 — MC is closing, so deactivate.
+                    if self.isMissionControlActive {
+                        DebugLog.log("MissionControlLabel", "1508 paired with 1401 → MC close", details: [
+                            "deltaMs": "\(Int(timeSinceSpaceChange * 1000))"
+                        ])
+                        self.deactivateMissionControl(reason: "1508-paired-with-1401")
+                    } else {
+                        DebugLog.log("MissionControlLabel", "1508 ignored (paired with 1401)", details: [
+                            "deltaMs": "\(Int(timeSinceSpaceChange * 1000))"
+                        ])
+                    }
                     return
                 }
                 if self.isMissionControlActive {
@@ -222,6 +238,14 @@ final class MissionControlLabelController {
 
     func hideImmediately(reason: String) {
         guard !Self.debugAlwaysVisible else { return }
+        // While MC is active the banners are intentionally visible. A
+        // Space change inside MC (Ctrl+←/→ in the strip) still fires the
+        // app's space-change event; hiding here would make the titles
+        // disappear in the MC thumbnails until the user closes MC.
+        guard !isMissionControlActive else {
+            DebugLog.log("MissionControlLabel", "hideImmediately skipped (MC active)", details: ["reason": reason])
+            return
+        }
         for window in windows.values {
             window.alphaValue = 0
         }
