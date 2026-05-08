@@ -291,7 +291,7 @@ final class MissionControlLabelController {
     private func applyVisibility(reason: String) {
         let activeSpaceID = spaceIdentifier.getActiveSpaceID()
 
-        for (_, window) in windows {
+        for (spaceID, window) in windows {
             let target: CGFloat
             if Self.debugAlwaysVisible {
                 target = 1
@@ -302,11 +302,14 @@ final class MissionControlLabelController {
             }
             window.alphaValue = target
 
-            // When making the banner visible, raise it above same-level
-            // user windows on its pinned Space so it is not occluded in
-            // the Mission Control thumbnail. The CGS-level reorder does
-            // NOT switch Spaces (NSWindow.orderFront would).
-            if target > 0 {
+            // Raise ONLY the active Space's banner above same-level user
+            // windows. Calling CGSOrderWindow on banners pinned to other
+            // Spaces makes macOS bounce focus back to the originating
+            // Space when the user clicks an MC thumbnail to switch — the
+            // raise on the previously-active Space's banner pulls the OS
+            // back. Limiting raise to the active Space preserves on-top
+            // rendering for the live MC preview without the bounce-back.
+            if target > 0 && spaceID == activeSpaceID {
                 window.raiseInZOrder()
             }
         }
