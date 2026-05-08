@@ -186,7 +186,6 @@ final class MissionControlLabelController {
         if !isMissionControlActive {
             isMissionControlActive = true
             applyVisibility(reason: "mc activate (\(reason))")
-            raiseNonActiveBanners()
         }
     }
 
@@ -290,13 +289,12 @@ final class MissionControlLabelController {
     ///     active Space's banner is alpha=1 only when the user has
     ///     opted-in via showMissionControlLabelOnActiveSpace; otherwise
     ///     it stays hidden so the live preview is uncovered.
-    ///   - z-order raise is intentionally NOT done here. It is performed
-    ///     exactly once per activation (see activateMissionControl) so it
-    ///     cannot fire during a Space-change race (NSWorkspace's
-    ///     activeSpaceDidChangeNotification can run BEFORE the 1401
-    ///     deactivation; raising the previously-active Space's banner in
-    ///     that window triggers macOS bounce-back on thumbnail-click
-    ///     Space switches).
+    ///   - The banner stays at NSWindow.Level.normal and we do NOT call
+    ///     CGSOrderWindow to raise it. Both higher levels and CGS reorders
+    ///     break per-Space pinning or cause Space-switch side effects on
+    ///     macOS Tahoe (bounce-back, multi-skip on Ctrl+arrow). The
+    ///     trade-off: user app windows on the same Space CAN occlude the
+    ///     banner inside that Space's MC thumbnail.
     private func applyVisibility(reason: String) {
         let activeSpaceID = spaceIdentifier.getActiveSpaceID()
         let showOnActive = settings.showMissionControlLabelOnActiveSpace
@@ -324,17 +322,6 @@ final class MissionControlLabelController {
         ])
     }
 
-    /// Raises every non-active Space's banner once on MC activation so
-    /// they win against user app windows in the MC thumbnail composite.
-    /// We deliberately do NOT raise on every applyVisibility — a raise
-    /// triggered during a thumbnail-click Space-change race causes macOS
-    /// to bounce focus back to the originating Space.
-    private func raiseNonActiveBanners() {
-        let activeSpaceID = spaceIdentifier.getActiveSpaceID()
-        for (spaceID, window) in windows where spaceID != activeSpaceID {
-            window.raiseInZOrder()
-        }
-    }
 }
 
 // MARK: - CGS notification monitor
@@ -488,17 +475,6 @@ private final class MissionControlLabelWindow: NSWindow {
         hosting.frame = NSRect(origin: .zero, size: frame.size)
         hosting.autoresizingMask = [.width, .height]
         contentView = hosting
-    }
-
-    /// Raises this window above other same-level windows on its pinned
-    /// Space without changing NSWindow.level (a level bump above .normal
-    /// breaks the per-Space pin on macOS Tahoe). The CGS reorder does NOT
-    /// switch Spaces (NSWindow.orderFront would).
-    func raiseInZOrder() {
-        guard windowNumber > 0 else { return }
-        let connection = CGSMainConnectionID()
-        // place=1 (kCGSOrderAbove), relative=0 → above the entire stack.
-        _ = CGSOrderWindow(connection, Int32(windowNumber), 1, 0)
     }
 
     private func pinToAssignedSpace() {
