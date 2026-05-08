@@ -189,10 +189,14 @@ final class MissionControlLabelController {
     }
 
     private func rearmSafetyTimer() {
-        // Long safety net in case 1507 is missed for any reason. Without this,
-        // a missed close would leave banners visible until app restart.
+        // Belt-and-braces deactivation in case both the close pulse and
+        // any in-MC space-change events are missed for some reason. 5
+        // minutes is long enough that a normal MC viewing session never
+        // hits it, but short enough that a stuck-active state self-heals
+        // without requiring an app restart. Earlier 60s was too short —
+        // it deactivated banners while the user was still browsing MC.
         mcDeactivationTimer?.invalidate()
-        let timer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: false) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: 300.0, repeats: false) { [weak self] _ in
             self?.deactivateMissionControl(reason: "safetyTimeout")
         }
         mcDeactivationTimer = timer
@@ -247,12 +251,11 @@ final class MissionControlLabelController {
         if isMissionControlActive {
             isMissionControlActive = false
             applyVisibility(reason: "mc deactivate (\(reason))")
-            // Lower the banners so the previous raise does not linger as
-            // a "remembered" top-of-stack request that could pull macOS
-            // back to the originating Space on subsequent navigation.
-            for window in windows.values {
-                window.lowerInZOrder()
-            }
+            // NB: do NOT call lowerInZOrder here. CGSOrderWindow(place=0)
+            // pushes the banner below desktop wallpaper level on macOS
+            // Tahoe, after which the next raise on activation can leave it
+            // invisible inside MC thumbnails (only the active Space banner
+            // shows up because the live preview composites on top).
         }
     }
 
