@@ -37,12 +37,48 @@ final class MissionControlLabelController {
 
     private var windows: [UInt64: MissionControlLabelWindow] = [:]
     private var workspaceObservers: [NSObjectProtocol] = []
-    private var isMissionControlActive = false
+    /// Protects `_isMissionControlActive`. Accessed from both the main
+    /// thread (every state mutation site) and the CGS / CGEventTap callback
+    /// background threads (read-only fast path before issuing CGS hides).
+    private let isMCActiveLock = NSLock()
+    private var _isMissionControlActive = false
+    private var isMissionControlActive: Bool {
+        get {
+            isMCActiveLock.lock()
+            defer { isMCActiveLock.unlock() }
+            return _isMissionControlActive
+        }
+        set {
+            isMCActiveLock.lock()
+            _isMissionControlActive = newValue
+            isMCActiveLock.unlock()
+        }
+    }
     private var cgsMonitor: CGSEventMonitor?
     private var globalMouseMonitor: Any?
     fileprivate var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
     private var eventTapThread: Thread?
+    /// Protects eventTapRunLoop / eventTapHealthTimer. They are written from
+    /// the dedicated event-tap bg thread (after CFRunLoopGetCurrent / Timer
+    /// init) and read from the main thread (stopEventTap teardown). Without
+    /// the lock, we have a data race AND a window where stopEventTap might
+    /// see nil for both fields (because the bg thread hasn't published yet)
+    /// and fail to stop the run loop, leaking the thread + leaving the tap
+    /// re-enabled by the health timer forever.
+    private let eventTapStateLock = NSLock()
+    /// CFRunLoop of the dedicated CGEventTap thread. Captured so stopEventTap
+    /// can call CFRunLoopStop and break out of CFRunLoopRun cleanly. Also used
+    /// to schedule Timer.invalidate on the thread that owns the timer.
+    private var eventTapRunLoop: CFRunLoop?
+    /// Health-check timer that re-enables the tap when macOS silently
+    /// disables it. Stored so stopEventTap can invalidate it; otherwise it
+    /// would keep the bg run loop alive and re-enable the tap forever.
+    private var eventTapHealthTimer: Timer?
+    /// Set while stopEventTap is in progress so the bg thread can publish
+    /// its run loop / timer and immediately shut itself down even if
+    /// stopEventTap raced ahead before the publish completed.
+    private var eventTapShutdownRequested = false
     /// Window IDs of all banners, cached for thread-safe access from the
     /// CGEventTap background thread. Updated atomically when windows change.
     private let bannerWindowIDsLock = NSLock()
@@ -126,14 +162,20 @@ final class MissionControlLabelController {
     }
 
     private func startEventTap() {
+        // Reset the shutdown flag at the start of a new tap lifecycle.
+        // Without this, a previous stopEventTap() leaves the flag set to
+        // true, and the next bg thread we start will see it on its first
+        // publish attempt and abort before CFRunLoopRun.
+        eventTapStateLock.lock()
+        eventTapShutdownRequested = false
+        eventTapRunLoop = nil
+        eventTapHealthTimer = nil
+        eventTapStateLock.unlock()
+
         let mask: CGEventMask =
             (1 << CGEventType.leftMouseDown.rawValue) |
             (1 << CGEventType.leftMouseUp.rawValue)
         let callback: CGEventTapCallBack = { _, type, event, _ in
-            // Log every event observed so we can verify the tap is firing.
-            DebugLog.log("MissionControlLabel", "eventTap callback", details: [
-                "type": "\(type.rawValue)"
-            ])
             switch type {
             case .leftMouseDown:
                 MissionControlLabelController.shared?.handleEventTapMouseDownFromBackground()
@@ -187,10 +229,11 @@ final class MissionControlLabelController {
         // closure for as long as CFRunLoopRun is running on the thread, and
         // CFMachPort does not support weak references (it's a CF type
         // bridged to NSMachPort which is not retainable for weak).
-        let thread = Thread {
+        let thread = Thread { [weak self] in
             Thread.current.name = "DesktopTitle-CGEventTap"
             DebugLog.log("MissionControlLabel", "CGEventTap thread starting CFRunLoop")
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            let runLoop = CFRunLoopGetCurrent()
+            CFRunLoopAddSource(runLoop, source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
 
             // macOS sometimes silently disables the tap without firing the
@@ -208,8 +251,33 @@ final class MissionControlLabelController {
             }
             RunLoop.current.add(healthTimer, forMode: .common)
 
+            // Publish run loop / timer under the lock so stopEventTap can
+            // see them. If stopEventTap already ran (race: shutdown
+            // requested before publish), exit immediately so we don't leak
+            // this thread.
+            var raced = false
+            self?.eventTapStateLock.lock()
+            if self?.eventTapShutdownRequested == true {
+                raced = true
+            } else {
+                self?.eventTapRunLoop = runLoop
+                self?.eventTapHealthTimer = healthTimer
+            }
+            self?.eventTapStateLock.unlock()
+
+            if raced {
+                healthTimer.invalidate()
+                DebugLog.log("MissionControlLabel", "CGEventTap thread aborting before run (shutdown raced)")
+                return
+            }
+
             CFRunLoopRun()
-            DebugLog.log("MissionControlLabel", "CGEventTap thread CFRunLoop returned (unexpected)")
+            // CFRunLoopRun returned — stopEventTap was called. Final
+            // cleanup of the timer happens here on the same thread that
+            // owns the timer (Timer.invalidate is documented to be called
+            // on the thread that scheduled the timer).
+            healthTimer.invalidate()
+            DebugLog.log("MissionControlLabel", "CGEventTap thread exited cleanly")
         }
         thread.qualityOfService = .userInteractive
         thread.start()
@@ -225,9 +293,33 @@ final class MissionControlLabelController {
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
-        // Letting the source go out of scope + tap disabled is enough to
-        // exit CFRunLoopRun on the dedicated thread shortly. We do not
-        // forcibly cancel the thread.
+
+        // Atomically take the bg-thread-published state and signal shutdown.
+        // If the bg thread hasn't published yet (raced ahead of stopEventTap),
+        // the eventTapShutdownRequested flag tells it to abort before
+        // entering CFRunLoopRun, so we can never leak the thread.
+        eventTapStateLock.lock()
+        eventTapShutdownRequested = true
+        let runLoop = eventTapRunLoop
+        let timer = eventTapHealthTimer
+        eventTapRunLoop = nil
+        eventTapHealthTimer = nil
+        eventTapStateLock.unlock()
+
+        if let runLoop {
+            // Schedule timer.invalidate on the thread that owns the timer
+            // (the bg event-tap thread's run loop) and then stop that run
+            // loop. CFRunLoopPerformBlock + CFRunLoopWakeUp ensures the
+            // block runs even if the run loop was idle when we called Stop.
+            if let timer {
+                CFRunLoopPerformBlock(runLoop, CFRunLoopMode.commonModes.rawValue) {
+                    timer.invalidate()
+                }
+            }
+            CFRunLoopStop(runLoop)
+            CFRunLoopWakeUp(runLoop)
+        }
+
         eventTap = nil
         eventTapSource = nil
         eventTapThread = nil
@@ -243,6 +335,17 @@ final class MissionControlLabelController {
         }
         bannerWindowIDsLock.lock()
         bannerWindowIDs = ids
+        bannerWindowIDsLock.unlock()
+    }
+
+    /// Atomically empties the cached banner windowIDs. Used in teardown
+    /// paths BEFORE closing the windows so the bg-thread CGS fast path
+    /// cannot read stale IDs and target windows whose IDs may have been
+    /// recycled by WindowServer for unrelated windows in the brief window
+    /// between window.close() and the next cache refresh.
+    private func clearBannerWindowIDsCache() {
+        bannerWindowIDsLock.lock()
+        bannerWindowIDs.removeAll()
         bannerWindowIDsLock.unlock()
     }
 
@@ -262,10 +365,9 @@ final class MissionControlLabelController {
     }
 
     /// Background-thread-safe wrapper around hideAllBannersViaCGS that
-    /// short-circuits when MC isn't active. `isMissionControlActive` is read
-    /// without a lock; a stale read of false is acceptable (we'd just skip
-    /// an unnecessary CGS call), and a stale read of true at most causes
-    /// one redundant alpha=0 to WindowServer (also harmless).
+    /// short-circuits when MC isn't active. `isMissionControlActive` is a
+    /// computed property guarded by `isMCActiveLock`, so the read here is
+    /// race-free with main-thread mutations.
     fileprivate func hideAllBannersViaCGSIfMCActive() {
         if isMissionControlActive {
             hideAllBannersViaCGS()
@@ -283,8 +385,10 @@ final class MissionControlLabelController {
     /// re-show banners while a transition is in progress. mouseUp / 1401 /
     /// close events all replace or cancel this restore as needed.
     fileprivate func handleEventTapMouseDownFromBackground() {
-        // CGS IPC: thread-safe, runs RIGHT NOW from the bg thread.
-        hideAllBannersViaCGS()
+        // CGS IPC: thread-safe, runs RIGHT NOW from the bg thread. The
+        // ...IfMCActive variant short-circuits when MC is inactive (every
+        // mouse-down system-wide reaches this callback, so the gate matters).
+        hideAllBannersViaCGSIfMCActive()
         // Then sync AppKit state on main.
         DispatchQueue.main.async { [weak self] in
             guard let self = self, self.isMissionControlActive else { return }
@@ -592,6 +696,11 @@ final class MissionControlLabelController {
 
         stopEventTap()
 
+        // Clear the cached IDs BEFORE closing the windows so the bg-thread
+        // CGS fast path cannot read stale IDs that have already been
+        // released to WindowServer (which is free to recycle them at any
+        // moment, including between our close() call and the next refresh).
+        clearBannerWindowIDsCache()
         for window in windows.values {
             window.close()
         }
@@ -661,6 +770,8 @@ final class MissionControlLabelController {
 
     private func tearDownAllWindows(reason: String) {
         guard !windows.isEmpty else { return }
+        // Clear the cached IDs BEFORE closing — see stop() for rationale.
+        clearBannerWindowIDsCache()
         for window in windows.values {
             window.close()
         }
@@ -911,15 +1022,6 @@ private final class MissionControlLabelWindow: NSWindow {
         let connection = CGSMainConnectionID()
         // place=1 (kCGSOrderAbove), relative=0 → above the entire stack.
         _ = CGSOrderWindow(connection, Int32(windowNumber), 1, 0)
-    }
-
-    /// Lowers this banner so subsequent raise side effects do not linger
-    /// once MC closes (see deactivateMissionControl cleanup).
-    func lowerInZOrder() {
-        guard windowNumber > 0 else { return }
-        let connection = CGSMainConnectionID()
-        // place=0 (kCGSOrderBelow), relative=0 → below the entire stack.
-        _ = CGSOrderWindow(connection, Int32(windowNumber), 0, 0)
     }
 
     private func pinToAssignedSpace() {
