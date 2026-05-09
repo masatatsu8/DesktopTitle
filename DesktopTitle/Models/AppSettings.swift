@@ -157,6 +157,18 @@ final class AppSettings: ObservableObject {
         didSet { saveGlobalSettings() }
     }
 
+    /// Whether to show desktop labels while Mission Control is open
+    @Published var showMissionControlLabels: Bool {
+        didSet { saveGlobalSettings() }
+    }
+
+    /// Whether to also show the active Space's banner in Mission Control.
+    /// When false (default), only non-active Space thumbnails get a banner —
+    /// the user already knows which desktop they're on.
+    @Published var showMissionControlLabelOnActiveSpace: Bool {
+        didSet { saveGlobalSettings() }
+    }
+
     /// The active screen configuration that owns the current profile.
     @Published private(set) var currentConfiguration: DisplayConfiguration
 
@@ -210,6 +222,8 @@ final class AppSettings: ObservableObject {
         static let legacyFontName = "fontName"
         static let showForFullscreen = "appSettings.showForFullscreen"
         static let showMenuBarTitle = "appSettings.showMenuBarTitle"
+        static let showMissionControlLabels = "appSettings.showMissionControlLabels"
+        static let showMissionControlLabelOnActiveSpace = "appSettings.showMissionControlLabelOnActiveSpace"
     }
 
     private init() {
@@ -264,6 +278,8 @@ final class AppSettings: ObservableObject {
         self.launchAtLogin = storedLaunchAtLogin ?? Self.isLaunchAtLoginRequested
         self.showForFullscreen = defaults.object(forKey: Keys.showForFullscreen) as? Bool ?? false
         self.showMenuBarTitle = defaults.object(forKey: Keys.showMenuBarTitle) as? Bool ?? true
+        self.showMissionControlLabels = defaults.object(forKey: Keys.showMissionControlLabels) as? Bool ?? true
+        self.showMissionControlLabelOnActiveSpace = defaults.object(forKey: Keys.showMissionControlLabelOnActiveSpace) as? Bool ?? false
 
         persistProfiles()
         saveGlobalSettings()
@@ -381,6 +397,8 @@ final class AppSettings: ObservableObject {
         defaults.set(launchAtLogin, forKey: Keys.launchAtLogin)
         defaults.set(showForFullscreen, forKey: Keys.showForFullscreen)
         defaults.set(showMenuBarTitle, forKey: Keys.showMenuBarTitle)
+        defaults.set(showMissionControlLabels, forKey: Keys.showMissionControlLabels)
+        defaults.set(showMissionControlLabelOnActiveSpace, forKey: Keys.showMissionControlLabelOnActiveSpace)
         defaults.synchronize()
     }
 
