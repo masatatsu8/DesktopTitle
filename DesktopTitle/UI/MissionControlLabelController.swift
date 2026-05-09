@@ -40,11 +40,19 @@ final class MissionControlLabelController {
     private var isMissionControlActive = false
     private var cgsMonitor: CGSEventMonitor?
     private var globalMouseMonitor: Any?
+    fileprivate var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
+    private var eventTapThread: Thread?
+    /// Window IDs of all banners, cached for thread-safe access from the
+    /// CGEventTap background thread. Updated atomically when windows change.
+    private let bannerWindowIDsLock = NSLock()
+    private var bannerWindowIDs: [UInt32] = []
     private var lastSpaceChangeAt: Date = .distantPast
     private var mcDeactivationTimer: Timer?
     private var pendingActivationWork: DispatchWorkItem?
     private var pending1508s: [Date] = []
     private var pending1508EvalWork: DispatchWorkItem?
+    private var pendingVisibilityRestore: DispatchWorkItem?
 
     /// Height (in points) of the MC thumbnail strip / target click region.
     /// A mouse-down inside this band while MC is active is treated as a
@@ -91,14 +99,25 @@ final class MissionControlLabelController {
         monitor.start()
         cgsMonitor = monitor
 
-        // Global mouse-down monitor. CGS Space-change events arrive a few
-        // ms AFTER macOS has already begun the destination thumbnail's
-        // zoom-in animation, so the banner is captured in the first few
-        // frames. Reacting to the mouse-down itself lets us hide the
-        // banners ~50–100 ms before the click registers as a Space switch.
+        // Global mouse-down monitor. Kept as a fallback because CGEventTap
+        // requires Input Monitoring permission. addGlobalMonitorForEvents
+        // does NOT see MC thumbnail clicks (WindowServer captures them
+        // before they're delivered as application events), so this is
+        // effectively only useful for non-MC click logging.
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             self?.handleGlobalMouseDown(event)
         }
+
+        // CGEventTap on kCGSessionEventTap. Runs at the system event-tap
+        // layer, so it sees mouse-downs DURING Mission Control (the MC UI
+        // does not consume them at this layer). The source is attached to
+        // the main run loop, which lets the callback run on the main thread
+        // synchronously when the run loop services it — eliminating the
+        // ~80 ms DispatchQueue.main.async hop that 1401-based hides suffer.
+        // CGEventTap requires Input Monitoring permission. If permission is
+        // missing, tapCreate returns nil and we silently fall back to the
+        // 1401 preemptive hide path (still works, just slower).
+        startEventTap()
 
         DebugLog.log("MissionControlLabel", "started", details: [
             "windowCount": "\(windows.count)",
@@ -106,17 +125,219 @@ final class MissionControlLabelController {
         ])
     }
 
+    private func startEventTap() {
+        let mask: CGEventMask =
+            (1 << CGEventType.leftMouseDown.rawValue) |
+            (1 << CGEventType.leftMouseUp.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, _ in
+            // Log every event observed so we can verify the tap is firing.
+            DebugLog.log("MissionControlLabel", "eventTap callback", details: [
+                "type": "\(type.rawValue)"
+            ])
+            switch type {
+            case .leftMouseDown:
+                MissionControlLabelController.shared?.handleEventTapMouseDownFromBackground()
+            case .leftMouseUp:
+                MissionControlLabelController.shared?.handleEventTapMouseUpFromBackground()
+            case .tapDisabledByTimeout, .tapDisabledByUserInput:
+                if let tap = MissionControlLabelController.shared?.eventTap {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                    DebugLog.log("MissionControlLabel", "CGEventTap re-enabled", details: [
+                        "reason": type == .tapDisabledByTimeout ? "timeout" : "userInput"
+                    ])
+                }
+            default:
+                break
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        // Use kCGSessionEventTap. HID-level tap is repeatedly auto-disabled
+        // by macOS Tahoe within ~500 ms of each enable (we logged this with
+        // a health-check timer), making it useless for our purpose. Session
+        // tap is more lenient and is what gets us reliable mouse-down
+        // delivery while MC is active.
+        let tapLocation: CGEventTapLocation = .cgSessionEventTap
+        guard let tap = CGEvent.tapCreate(
+            tap: tapLocation,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: mask,
+            callback: callback,
+            userInfo: nil
+        ) else {
+            DebugLog.log("MissionControlLabel", "CGEventTap creation failed")
+            return
+        }
+        DebugLog.log("MissionControlLabel", "CGEventTap created", details: [
+            "tapLocation": "Session"
+        ])
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+
+        // Run the tap on a dedicated background thread with its own
+        // CFRunLoop. Attaching the tap source to the MAIN run loop made the
+        // tap susceptible to tapDisabledByUserInput whenever the main queue
+        // was busy (e.g., during MC open / Space-change CGS bursts), causing
+        // the tap to silently stop firing right at the moment we needed it
+        // (the user's thumbnail click). A dedicated userInteractive thread
+        // services the tap independently of main-queue load, so the callback
+        // runs immediately on mouse-down.
+        // Capture tap and source strongly — they need to outlive this
+        // closure for as long as CFRunLoopRun is running on the thread, and
+        // CFMachPort does not support weak references (it's a CF type
+        // bridged to NSMachPort which is not retainable for weak).
+        let thread = Thread {
+            Thread.current.name = "DesktopTitle-CGEventTap"
+            DebugLog.log("MissionControlLabel", "CGEventTap thread starting CFRunLoop")
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+
+            // macOS sometimes silently disables the tap without firing the
+            // tapDisabledBy* event. Periodically check tap state and re-
+            // enable when needed. The timer is scheduled on this thread's
+            // run loop, so it runs alongside the tap callback.
+            let healthTimer = Timer(
+                timeInterval: 0.5,
+                repeats: true
+            ) { _ in
+                if !CGEvent.tapIsEnabled(tap: tap) {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                    DebugLog.log("MissionControlLabel", "CGEventTap re-enabled (health-check)")
+                }
+            }
+            RunLoop.current.add(healthTimer, forMode: .common)
+
+            CFRunLoopRun()
+            DebugLog.log("MissionControlLabel", "CGEventTap thread CFRunLoop returned (unexpected)")
+        }
+        thread.qualityOfService = .userInteractive
+        thread.start()
+
+        eventTap = tap
+        eventTapSource = source
+        eventTapThread = thread
+
+        DebugLog.log("MissionControlLabel", "CGEventTap started (dedicated thread)")
+    }
+
+    private func stopEventTap() {
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        // Letting the source go out of scope + tap disabled is enough to
+        // exit CFRunLoopRun on the dedicated thread shortly. We do not
+        // forcibly cancel the thread.
+        eventTap = nil
+        eventTapSource = nil
+        eventTapThread = nil
+    }
+
+    /// Updates the cached banner windowIDs used by the CGEventTap background
+    /// thread for direct CGSSetWindowAlpha calls. Call from main thread
+    /// whenever the banner window set changes.
+    private func refreshBannerWindowIDsCache() {
+        let ids = windows.values.compactMap { window -> UInt32? in
+            let n = window.windowNumber
+            return n > 0 ? UInt32(n) : nil
+        }
+        bannerWindowIDsLock.lock()
+        bannerWindowIDs = ids
+        bannerWindowIDsLock.unlock()
+    }
+
+    /// Synchronously hides every banner via direct WindowServer IPC. Safe
+    /// to call from any thread because CGSSetWindowAlpha is a Mach IPC call,
+    /// not an AppKit call. Used from the CGEventTap background thread to
+    /// drop banner alpha to 0 the same instant a left mouse-down is observed,
+    /// before the click can commit a Space switch and start a zoom-in.
+    private func hideAllBannersViaCGS() {
+        bannerWindowIDsLock.lock()
+        let ids = bannerWindowIDs
+        bannerWindowIDsLock.unlock()
+        let connection = CGSMainConnectionID()
+        for id in ids {
+            _ = CGSSetWindowAlpha(connection, id, 0)
+        }
+    }
+
+    /// Background-thread-safe wrapper around hideAllBannersViaCGS that
+    /// short-circuits when MC isn't active. `isMissionControlActive` is read
+    /// without a lock; a stale read of false is acceptable (we'd just skip
+    /// an unnecessary CGS call), and a stale read of true at most causes
+    /// one redundant alpha=0 to WindowServer (also harmless).
+    fileprivate func hideAllBannersViaCGSIfMCActive() {
+        if isMissionControlActive {
+            hideAllBannersViaCGS()
+        }
+    }
+
+    /// Called from the CGEventTap dedicated background thread. We use the
+    /// thread-safe CGSSetWindowAlpha private API to drop every banner's
+    /// alpha to 0 the instant a left mouse-down is observed — without ever
+    /// hopping to the main thread. The follow-up dispatch syncs NSWindow's
+    /// own alphaValue state on main so AppKit / SwiftUI agree with the
+    /// WindowServer state. We schedule a LONG fallback restore (5 s) so the
+    /// `pendingVisibilityRestore` flag stays set throughout the hold-time
+    /// + zoom-in window — applyVisibility checks this flag and refuses to
+    /// re-show banners while a transition is in progress. mouseUp / 1401 /
+    /// close events all replace or cancel this restore as needed.
+    fileprivate func handleEventTapMouseDownFromBackground() {
+        // CGS IPC: thread-safe, runs RIGHT NOW from the bg thread.
+        hideAllBannersViaCGS()
+        // Then sync AppKit state on main.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isMissionControlActive else { return }
+            for window in self.windows.values {
+                window.alphaValue = 0
+            }
+            // Long fallback so pendingVisibilityRestore is non-nil for the
+            // entire click → zoom → close window. applyVisibility uses this
+            // to suppress alpha=1 restores from rebuildWindows triggered by
+            // NSWorkspace.activeSpaceDidChange while zoom-in is on screen.
+            self.scheduleVisibilityRestore(after: 5.0, reason: "eventTap-mouseDown fallback")
+            DebugLog.log("MissionControlLabel", "eventTap mouseDown handled", details: [:])
+        }
+    }
+
+    /// On mouse-up: schedule deferred restore on main. The CGS bursts that
+    /// follow a thumbnail click (1401 + 1508×2) will cancel or re-schedule
+    /// this restore as needed. For benign clicks that do not switch Space
+    /// or close MC, this restore re-shows the banners after a longer delay.
+    /// 600 ms gives the click → MC close pipeline plenty of time to fire
+    /// the 1508 close burst (we have observed 294 ms gaps); restoring earlier
+    /// re-shows the banners while the zoom-in is still on screen.
+    fileprivate func handleEventTapMouseUpFromBackground() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isMissionControlActive else { return }
+            self.scheduleVisibilityRestore(after: 0.6, reason: "eventTap-mouseUp restore")
+        }
+    }
+
     private func handleGlobalMouseDown(_ event: NSEvent) {
         guard isMissionControlActive else { return }
-        // NSEvent.mouseLocation gives screen coordinates with origin at the
-        // bottom-left of the primary display. The MC thumbnail strip sits
-        // at the TOP of the screen — a mouse-down up there during MC is
-        // very likely a thumbnail click.
+        // NSEvent.mouseLocation is in the unified screen coordinate system
+        // (origin = bottom-left of the primary display). The MC thumbnail
+        // strip sits at the TOP of EACH display — with an external display
+        // attached, the cursor can be on either screen, so check the screen
+        // that contains the cursor rather than assuming NSScreen.main.
         let location = NSEvent.mouseLocation
-        guard let mainScreen = NSScreen.main else { return }
-        let topY = mainScreen.frame.maxY
-        if location.y >= topY - Self.mcStripHeight {
-            hideAllBannersImmediately(reason: "mouseDown-in-mc-strip y=\(Int(location.y)) topY=\(Int(topY))")
+        let screen = NSScreen.screens.first(where: { NSPointInRect(location, $0.frame) })
+        let inStrip: Bool
+        if let screen {
+            let topY = screen.frame.maxY
+            inStrip = location.y >= topY - Self.mcStripHeight
+        } else {
+            inStrip = false
+        }
+        DebugLog.log("MissionControlLabel", "mouseDown while MC active", details: [
+            "x": "\(Int(location.x))",
+            "y": "\(Int(location.y))",
+            "screen": screen?.displayUUIDString ?? "nil",
+            "inStrip": "\(inStrip)"
+        ])
+        if inStrip {
+            hideAllBannersImmediately(reason: "mouseDown-in-mc-strip x=\(Int(location.x)) y=\(Int(location.y))")
         }
     }
 
@@ -133,19 +354,21 @@ final class MissionControlLabelController {
             // MC is open) fires 1401 alone — MC stays open. Click-thumbnail
             // also fires 1401 but is followed by a paired 1508 close pulse;
             // the 1508 handler is responsible for closing MC in that case.
-            // Just refresh visibility so the new active Space is reflected.
+            //
+            // We unconditionally hide ALL banners while MC is active and
+            // schedule a deferred restore. NSEvent.addGlobalMonitorForEvents
+            // does not reliably fire for MC thumbnail clicks (WindowServer
+            // captures them before global monitor delivery on Tahoe), so the
+            // mouse-down hide path is unreliable. Hiding here on 1401 catches
+            // both click-thumbnail (then close burst cancels the restore so
+            // the hide sticks through the zoom-in) and Ctrl+arrow in-MC
+            // navigation (no close burst → restore re-shows the banners
+            // after a short flicker).
             lastSpaceChangeAt = Date()
             cancelPendingActivation(reason: "1401-spaceChange")
-            // If 1508s have already arrived for this same instant, this is
-            // a click-thumbnail close (1508+1401 fire together). Hide the
-            // banners synchronously so they vanish before the MC zoom-in
-            // animation starts — otherwise the user sees the banner zoom
-            // into view on the destination Space.
-            if isMissionControlActive && !pending1508s.isEmpty {
-                hideAllBannersImmediately(reason: "1401-with-pending-1508")
-            }
             if isMissionControlActive {
-                applyVisibility(reason: "1401-spaceChange")
+                hideAllBannersImmediately(reason: "1401-spaceChange preemptive")
+                scheduleVisibilityRestore(after: 0.2, reason: "1401-spaceChange restore")
             }
         case 1508:
             // Buffer all 1508 events that arrive within
@@ -218,6 +441,7 @@ final class MissionControlLabelController {
                 "wasActive": "\(isMissionControlActive)"
             ])
             cancelPendingActivation(reason: "1508-close")
+            cancelPendingVisibilityRestore(reason: "1508-close")
             if isMissionControlActive {
                 deactivateMissionControl(reason: "1508-close")
             }
@@ -263,6 +487,27 @@ final class MissionControlLabelController {
         mcDeactivationTimer = timer
     }
 
+    private func scheduleVisibilityRestore(after delay: TimeInterval, reason: String) {
+        pendingVisibilityRestore?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingVisibilityRestore = nil
+            guard self.isMissionControlActive else { return }
+            self.applyVisibility(reason: reason)
+        }
+        pendingVisibilityRestore = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func cancelPendingVisibilityRestore(reason: String) {
+        guard pendingVisibilityRestore != nil else { return }
+        pendingVisibilityRestore?.cancel()
+        pendingVisibilityRestore = nil
+        DebugLog.log("MissionControlLabel", "cancelled visibility restore", details: [
+            "reason": reason
+        ])
+    }
+
     private func scheduleDelayedActivation(reason: String) {
         cancelPendingActivation(reason: "rescheduled")
         let work = DispatchWorkItem { [weak self] in
@@ -297,9 +542,11 @@ final class MissionControlLabelController {
             // here (once on activation) and lowering them on deactivation
             // keeps the z-state clean — repeating the raise on every
             // applyVisibility caused MC bounce-back / multi-skip in
-            // earlier iterations.
-            let activeID = spaceIdentifier.getActiveSpaceID()
-            for (spaceID, window) in windows where spaceID != activeID {
+            // earlier iterations. Skip every display's active Space (not
+            // just the primary's) so external displays' active Spaces are
+            // also left alone.
+            let activePerDisplay = Set(spaceIdentifier.getCurrentSpacesByDisplay().values.map(\.id))
+            for (spaceID, window) in windows where !activePerDisplay.contains(spaceID) {
                 window.raiseInZOrder()
             }
         }
@@ -307,6 +554,7 @@ final class MissionControlLabelController {
 
     private func deactivateMissionControl(reason: String) {
         cancelPendingActivation(reason: "deactivate")
+        cancelPendingVisibilityRestore(reason: "deactivate")
         mcDeactivationTimer?.invalidate()
         mcDeactivationTimer = nil
         if isMissionControlActive {
@@ -322,6 +570,7 @@ final class MissionControlLabelController {
 
     func stop() {
         cancelPendingActivation(reason: "stop")
+        cancelPendingVisibilityRestore(reason: "stop")
         pending1508EvalWork?.cancel()
         pending1508EvalWork = nil
         pending1508s.removeAll()
@@ -340,6 +589,8 @@ final class MissionControlLabelController {
             NSEvent.removeMonitor(monitor)
             globalMouseMonitor = nil
         }
+
+        stopEventTap()
 
         for window in windows.values {
             window.close()
@@ -399,6 +650,7 @@ final class MissionControlLabelController {
             }
         }
 
+        refreshBannerWindowIDsCache()
         applyVisibility(reason: "rebuildWindows")
 
         DebugLog.log("MissionControlLabel", "rebuilt windows", details: [
@@ -433,8 +685,22 @@ final class MissionControlLabelController {
     ///     trade-off: user app windows on the same Space CAN occlude the
     ///     banner inside that Space's MC thumbnail.
     private func applyVisibility(reason: String) {
-        let activeSpaceID = spaceIdentifier.getActiveSpaceID()
+        // Each display has its own "active" Space. With an external display
+        // attached, getActiveSpaceID() only reports ONE Space (the focused
+        // display's), so the external display's active Space would still get
+        // target=1 and the giant banner would show on it during MC. Use the
+        // per-display map instead so every display's active Space is treated
+        // as the local "do not show banner" Space.
+        let activePerDisplay = Set(spaceIdentifier.getCurrentSpacesByDisplay().values.map(\.id))
         let showOnActive = settings.showMissionControlLabelOnActiveSpace
+        // While a visibility restore is pending we are in a click → zoom →
+        // close transition. applyVisibility called here from rebuildWindows
+        // (triggered by NSWorkspace.activeSpaceDidChangeNotification) would
+        // otherwise reset non-active banners back to alpha=1 mid-zoom-in,
+        // which is exactly the giant banner the user sees during zoom.
+        // Suppress here; the pending restore will fire applyVisibility again
+        // (with pendingVisibilityRestore == nil) once the transition is over.
+        let inTransition = (pendingVisibilityRestore != nil)
 
         for (spaceID, window) in windows {
             let target: CGFloat
@@ -442,7 +708,9 @@ final class MissionControlLabelController {
                 target = 1
             } else if !isMissionControlActive {
                 target = 0
-            } else if spaceID == activeSpaceID {
+            } else if inTransition {
+                target = 0
+            } else if activePerDisplay.contains(spaceID) {
                 target = showOnActive ? 1 : 0
             } else {
                 target = 1
@@ -453,7 +721,8 @@ final class MissionControlLabelController {
         DebugLog.log("MissionControlLabel", "applied visibility", details: [
             "reason": reason,
             "isMissionControlActive": "\(isMissionControlActive)",
-            "activeSpaceID": "\(activeSpaceID)",
+            "inTransition": "\(inTransition)",
+            "activePerDisplay": activePerDisplay.sorted().map(String.init).joined(separator: ","),
             "showOnActive": "\(showOnActive)",
             "windowCount": "\(windows.count)"
         ])
@@ -503,6 +772,26 @@ private let cgsNotifyCallback: CGSNotifyProcPtr = { type, _, length, _ in
         "type": "\(type)",
         "length": "\(length)"
     ])
+    // For 1401 (active Space changed) — and 1508 (MC toggle, including the
+    // close burst that follows a thumbnail click) — synchronously hide all
+    // banners via direct WindowServer IPC (CGSSetWindowAlpha). NSWindow's
+    // alphaValue setter requires the main thread, but CGSSetWindowAlpha is
+    // a Mach IPC that's safe from the CGS callback thread. This eliminates
+    // the ~30–80 ms DispatchQueue.main.async hop that lets the MC zoom-in
+    // animation capture alpha=1 banners — by the time the main handler
+    // gets to run, the WindowServer already shows alpha=0.
+    if type == 1401 || type == 1508 {
+        MissionControlLabelController.shared?.hideAllBannersViaCGSIfMCActive()
+        // Force-enable the CGEventTap on every MC-related CGS event. macOS
+        // Tahoe silently disables listenOnly taps during idle, and our
+        // 500 ms health-check timer can miss the very first click after
+        // MC opens (the user-reported "1回目だけバナーが見える" pattern).
+        // Re-enabling here guarantees the tap is hot at MC open time so
+        // the upcoming thumbnail click fires our mouse-down handler.
+        if let tap = MissionControlLabelController.shared?.eventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+    }
     DispatchQueue.main.async {
         MissionControlLabelController.shared?.handleCGSNotification(type: type)
     }

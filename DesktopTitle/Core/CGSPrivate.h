@@ -70,4 +70,11 @@ CG_EXTERN CGError CGSRemoveNotifyProc(CGSNotifyProcPtr _Nonnull proc, uint32_t t
 // the windowID we order relative to, or 0 for "the entire stack".
 CG_EXTERN CGError CGSOrderWindow(CGSConnectionID cid, int windowID, int place, int relative);
 
+// Set a window's alpha directly via WindowServer IPC. Unlike NSWindow's
+// `alphaValue` setter (which must be called on the main thread), this is
+// safe to call from any thread because it just sends a Mach IPC message
+// to WindowServer. Useful for ultra-low-latency hides from a background
+// CGEventTap callback before the main thread can service the request.
+CG_EXTERN CGError CGSSetWindowAlpha(CGSConnectionID cid, uint32_t windowID, float alpha);
+
 #endif /* CGSPrivate_h */
