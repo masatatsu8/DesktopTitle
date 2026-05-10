@@ -1009,7 +1009,7 @@ private final class MissionControlLabelWindow: NSWindow {
         // switch. After this, pinToAssignedSpace moves it to the target Space.
         // Subsequent updates MUST NOT orderFront — see update(space:).
         orderFrontRegardless()
-        pinToAssignedSpace()
+        pinToAssignedSpace(reason: "initial")
     }
 
     override var canBecomeKey: Bool { false }
@@ -1042,6 +1042,7 @@ private final class MissionControlLabelWindow: NSWindow {
     }
 
     func update(space: SpaceInfo) {
+        let previousPinnedSpaceID = pinnedSpaceID
         pinnedSpaceID = space.id
 
         if let screen = NSScreen.screens.first(where: { $0.displayUUIDString == space.displayID }) ?? NSScreen.main {
@@ -1049,9 +1050,11 @@ private final class MissionControlLabelWindow: NSWindow {
         }
 
         installContent(for: space)
-        // pinToAssignedSpace is idempotent and does NOT order the window front,
-        // so it is safe to call from update without forcing a Space switch.
-        pinToAssignedSpace()
+        // Routine content/frame refreshes must not mutate CGS Space membership:
+        // even "idempotent" CGS add/remove bursts can drag the active Space.
+        if previousPinnedSpaceID != space.id {
+            pinToAssignedSpace(reason: "spaceIDChanged")
+        }
 
         DebugLog.log("MissionControlLabel", "updated label window", details: [
             "space": DebugLog.describe(space: space),
@@ -1098,7 +1101,7 @@ private final class MissionControlLabelWindow: NSWindow {
         _ = CGSOrderWindow(connection, Int32(windowNumber), 1, 0)
     }
 
-    private func pinToAssignedSpace() {
+    private func pinToAssignedSpace(reason: String) {
         guard windowNumber > 0 else { return }
 
         let connection = CGSMainConnectionID()
@@ -1130,6 +1133,12 @@ private final class MissionControlLabelWindow: NSWindow {
                 )
             }
         }
+
+        DebugLog.log("MissionControlLabel", "pinned label window to space", details: [
+            "reason": reason,
+            "spaceID": "\(pinnedSpaceID)",
+            "window": DebugLog.describe(window: self)
+        ])
     }
 
     private func unpinFromSpaces() {
