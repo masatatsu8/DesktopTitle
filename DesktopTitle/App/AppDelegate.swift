@@ -163,7 +163,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 continue
             }
 
-            showOverlay(for: space)
+            let delayOverride = missionControlLabelController.desktopOverlayDelayOverrideForSpaceChange(
+                defaultDelay: settings.displayDelay
+            )
+            if let delayOverride {
+                DebugLog.log(
+                    "AppDelegate",
+                    "delaying overlay for Mission Control transition",
+                    details: [
+                        "space": DebugLog.describe(space: space),
+                        "delay": String(format: "%.3f", delayOverride)
+                    ]
+                )
+            }
+            showOverlay(for: space, delayOverride: delayOverride)
         }
     }
 
