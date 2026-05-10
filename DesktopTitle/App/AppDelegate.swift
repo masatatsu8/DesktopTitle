@@ -166,9 +166,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             let delayOverride = missionControlLabelController.desktopOverlayDelayOverrideForSpaceChange(
-                defaultDelay: Self.spaceSwitchOverlayMinimumDelay
+                defaultDelay: settings.displayDelay
             )
-            let effectiveDelay = delayOverride ?? max(settings.displayDelay, Self.spaceSwitchOverlayMinimumDelay)
+            let effectiveDelay = max(delayOverride ?? settings.displayDelay, Self.spaceSwitchOverlayMinimumDelay)
             if let delayOverride {
                 DebugLog.log(
                     "AppDelegate",
