@@ -11,6 +11,7 @@ import Combine
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var shared: AppDelegate?
+    private static let spaceSwitchOverlayMinimumDelay: TimeInterval = 0.35
 
     private var menuBarController: MenuBarController?
     private let missionControlLabelController = MissionControlLabelController()
@@ -114,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleSpaceChange(_ event: SpaceChangeEvent) {
         missionControlLabelController.hideImmediately(reason: "spaceChangeEvent")
+        hideActiveOverlays(reason: "spaceChangeEvent")
 
         guard !event.changedSpaces.isEmpty else {
             DebugLog.log(
@@ -163,8 +165,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 continue
             }
 
-            showOverlay(for: space)
+            let delayOverride = missionControlLabelController.desktopOverlayDelayOverrideForSpaceChange(
+                defaultDelay: settings.displayDelay
+            )
+            let effectiveDelay = max(delayOverride ?? settings.displayDelay, Self.spaceSwitchOverlayMinimumDelay)
+            if let delayOverride {
+                DebugLog.log(
+                    "AppDelegate",
+                    "delaying overlay for Mission Control transition",
+                    details: [
+                        "space": DebugLog.describe(space: space),
+                        "delay": String(format: "%.3f", delayOverride)
+                    ]
+                )
+            }
+            showOverlay(for: space, delayOverride: effectiveDelay)
         }
+    }
+
+    private func hideActiveOverlays(reason: String) {
+        guard !overlayWindows.isEmpty else { return }
+
+        for (displayID, window) in overlayWindows {
+            DebugLog.log(
+                "AppDelegate",
+                "hiding active overlay",
+                details: [
+                    "display": DebugLog.shortDisplayID(displayID),
+                    "reason": reason
+                ]
+            )
+            window.hide(reason: reason)
+        }
+        overlayWindows.removeAll()
     }
 
     func showPreviewOverlay(for previewSpace: SpaceInfo? = nil) {
