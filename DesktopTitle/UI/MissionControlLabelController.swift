@@ -685,6 +685,19 @@ final class MissionControlLabelController {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingActivationWork = nil
+            let visibleDisplayIDs = self.missionControlVisibleDisplayIDsInWindowList()
+            guard !visibleDisplayIDs.isEmpty else {
+                self.hideAllBannersImmediately(reason: "activation skipped; no Mission Control window")
+                DebugLog.log("MissionControlLabel", "skipped delayed activation", details: [
+                    "reason": reason,
+                    "validation": "no Mission Control Dock window"
+                ])
+                return
+            }
+            DebugLog.log("MissionControlLabel", "validated delayed activation", details: [
+                "reason": reason,
+                "missionControlDisplays": visibleDisplayIDs.sorted().joined(separator: ",")
+            ])
             self.activateMissionControl(reason: "\(reason) (after \(Int(Self.activationDelay * 1000))ms)")
         }
         pendingActivationWork = work
@@ -693,6 +706,73 @@ final class MissionControlLabelController {
             "delayMs": "\(Int(Self.activationDelay * 1000))"
         ])
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.activationDelay, execute: work)
+    }
+
+    private func missionControlVisibleDisplayIDsInWindowList() -> Set<String> {
+        guard let windowList = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+
+        let screenFrames = quartzScreenFramesByDisplayID()
+        guard !screenFrames.isEmpty else { return [] }
+
+        var displayIDs = Set<String>()
+        for windowInfo in windowList {
+            guard windowInfo[kCGWindowOwnerName as String] as? String == "Dock" else {
+                continue
+            }
+
+            if let name = windowInfo[kCGWindowName as String] as? String,
+               name.hasPrefix("Wallpaper-") {
+                continue
+            }
+
+            let layer = (windowInfo[kCGWindowLayer as String] as? NSNumber)?.intValue ?? Int.min
+            guard layer >= 0 else { continue }
+
+            guard let frame = windowFrame(from: windowInfo) else {
+                continue
+            }
+
+            for (displayID, screenFrame) in screenFrames {
+                guard frame.intersection(screenFrame).isNull == false else { continue }
+                let overlap = frame.intersection(screenFrame)
+                let overlapArea = overlap.width * overlap.height
+                let screenArea = screenFrame.width * screenFrame.height
+                if screenArea > 0, overlapArea >= screenArea * 0.6 {
+                    displayIDs.insert(displayID)
+                }
+            }
+        }
+
+        return displayIDs
+    }
+
+    private func quartzScreenFramesByDisplayID() -> [String: CGRect] {
+        guard let mainFrame = NSScreen.main?.frame else { return [:] }
+        var frames: [String: CGRect] = [:]
+        for screen in NSScreen.screens {
+            guard let displayID = screen.displayUUIDString else { continue }
+            let frame = screen.frame
+            frames[displayID] = CGRect(
+                x: frame.minX,
+                y: mainFrame.maxY - frame.maxY,
+                width: frame.width,
+                height: frame.height
+            )
+        }
+        return frames
+    }
+
+    private func windowFrame(from windowInfo: [String: Any]) -> CGRect? {
+        guard let bounds = windowInfo[kCGWindowBounds as String] as? [String: Any],
+              let x = (bounds["X"] as? NSNumber)?.doubleValue,
+              let y = (bounds["Y"] as? NSNumber)?.doubleValue,
+              let width = (bounds["Width"] as? NSNumber)?.doubleValue,
+              let height = (bounds["Height"] as? NSNumber)?.doubleValue else {
+            return nil
+        }
+        return CGRect(x: x, y: y, width: width, height: height)
     }
 
     private func cancelPendingActivation(reason: String) {
@@ -876,7 +956,10 @@ final class MissionControlLabelController {
         // target=1 and the giant banner would show on it during MC. Use the
         // per-display map instead so every display's active Space is treated
         // as the local "do not show banner" Space.
+        let spaces = spaceIdentifier.getAllSpaces()
+        let displayIDBySpaceID = Dictionary(uniqueKeysWithValues: spaces.map { ($0.id, $0.displayID) })
         let activePerDisplay = Set(spaceIdentifier.getCurrentSpacesByDisplay().values.map(\.id))
+        let missionControlDisplayIDs = isMissionControlActive ? missionControlVisibleDisplayIDsInWindowList() : []
         let showOnActive = settings.showMissionControlLabelOnActiveSpace
         // While a visibility restore is pending we are in a click → zoom →
         // close transition. applyVisibility called here from rebuildWindows
@@ -895,6 +978,9 @@ final class MissionControlLabelController {
                 target = 0
             } else if inTransition {
                 target = 0
+            } else if let displayID = displayIDBySpaceID[spaceID],
+                      !missionControlDisplayIDs.contains(displayID) {
+                target = 0
             } else if activePerDisplay.contains(spaceID) {
                 target = showOnActive ? 1 : 0
             } else {
@@ -908,6 +994,7 @@ final class MissionControlLabelController {
             "isMissionControlActive": "\(isMissionControlActive)",
             "inTransition": "\(inTransition)",
             "activePerDisplay": activePerDisplay.sorted().map(String.init).joined(separator: ","),
+            "missionControlDisplays": missionControlDisplayIDs.sorted().joined(separator: ","),
             "showOnActive": "\(showOnActive)",
             "windowCount": "\(windows.count)"
         ])
