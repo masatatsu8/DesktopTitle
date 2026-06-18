@@ -133,7 +133,7 @@ final class MissionControlLabelController {
 
     func start() {
         Self.shared = self
-        rebuildWindows()
+        rebuildWindows(reason: "start")
 
         workspaceObservers.append(
             NSWorkspace.shared.notificationCenter.addObserver(
@@ -141,7 +141,7 @@ final class MissionControlLabelController {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.rebuildWindows()
+                self?.syncWindowsAfterActiveSpaceChange()
             }
         )
 
@@ -254,13 +254,18 @@ final class MissionControlLabelController {
             // tapDisabledBy* event. Periodically check tap state and re-
             // enable when needed. The timer is scheduled on this thread's
             // run loop, so it runs alongside the tap callback.
+            var lastHealthCheckLogAt = Date.distantPast
             let healthTimer = Timer(
                 timeInterval: 0.5,
                 repeats: true
             ) { _ in
                 if !CGEvent.tapIsEnabled(tap: tap) {
                     CGEvent.tapEnable(tap: tap, enable: true)
-                    DebugLog.log("MissionControlLabel", "CGEventTap re-enabled (health-check)")
+                    let now = Date()
+                    if now.timeIntervalSince(lastHealthCheckLogAt) >= 60 {
+                        lastHealthCheckLogAt = now
+                        DebugLog.log("MissionControlLabel", "CGEventTap re-enabled (health-check)")
+                    }
                 }
             }
             RunLoop.current.add(healthTimer, forMode: .common)
@@ -790,22 +795,6 @@ final class MissionControlLabelController {
             clearVisibilityTransitionSuppression(reason: "activate")
             isMissionControlActive = true
             applyVisibility(reason: "mc activate (\(reason))")
-            // Raise EVERY banner above same-level user windows on activate.
-            // Earlier iterations skipped active-per-display banners on the
-            // theory that they're alpha=0 and don't need to be on top, but
-            // that left a footgun: if the user opens MC on Space X and
-            // then Ctrl+arrow's away, X becomes non-active mid-MC and its
-            // banner switches to alpha=1 — but its z-order was never
-            // raised, so user app windows on X occlude the banner inside
-            // X's thumbnail. Raising every banner avoids this regardless
-            // of which Space the user starts MC on or where they navigate.
-            // Active banners stay at alpha=0 so the raise has no visible
-            // side effect (the live preview composites on top of them).
-            // We still do this only ONCE per MC session — repeating raises
-            // on every applyVisibility caused MC bounce-back / multi-skip.
-            for window in windows.values {
-                window.raiseInZOrder()
-            }
         }
     }
 
@@ -880,19 +869,40 @@ final class MissionControlLabelController {
     }
 
     func refreshLabels() {
-        rebuildWindows()
+        rebuildWindows(reason: "refreshLabels")
     }
 
     // MARK: - Window lifecycle
 
-    private func rebuildWindows() {
+    private func syncWindowsAfterActiveSpaceChange() {
         guard settings.showMissionControlLabels else {
             tearDownAllWindows(reason: "settingDisabled")
             return
         }
 
-        let spaces = spaceIdentifier.getAllSpaces()
-            .filter { settings.showForFullscreen || !$0.isFullscreen }
+        let spaces = eligibleLabelSpaces()
+        let liveSpaceIDs = Set(spaces.map { $0.id })
+        let existingSpaceIDs = Set(windows.keys)
+
+        guard liveSpaceIDs == existingSpaceIDs else {
+            rebuildWindows(reason: "activeSpaceChanged-topologyChanged")
+            return
+        }
+
+        applyVisibility(reason: "activeSpaceChanged")
+        DebugLog.log("MissionControlLabel", "active Space changed without rebuilding label windows", details: [
+            "windowCount": "\(windows.count)",
+            "spaceIDs": liveSpaceIDs.sorted().map(String.init).joined(separator: ",")
+        ])
+    }
+
+    private func rebuildWindows(reason: String) {
+        guard settings.showMissionControlLabels else {
+            tearDownAllWindows(reason: "settingDisabled")
+            return
+        }
+
+        let spaces = eligibleLabelSpaces()
 
         let liveSpaceIDs = Set(spaces.map { $0.id })
 
@@ -914,12 +924,18 @@ final class MissionControlLabelController {
         }
 
         refreshBannerWindowIDsCache()
-        applyVisibility(reason: "rebuildWindows")
+        applyVisibility(reason: "rebuildWindows (\(reason))")
 
         DebugLog.log("MissionControlLabel", "rebuilt windows", details: [
+            "reason": reason,
             "windowCount": "\(windows.count)",
             "spaces": DebugLog.describe(spaces: spaces)
         ])
+    }
+
+    private func eligibleLabelSpaces() -> [SpaceInfo] {
+        spaceIdentifier.getAllSpaces()
+            .filter { settings.showForFullscreen || !$0.isFullscreen }
     }
 
     private func tearDownAllWindows(reason: String) {
@@ -962,12 +978,11 @@ final class MissionControlLabelController {
         let missionControlDisplayIDs = isMissionControlActive ? missionControlVisibleDisplayIDsInWindowList() : []
         let showOnActive = settings.showMissionControlLabelOnActiveSpace
         // While a visibility restore is pending we are in a click → zoom →
-        // close transition. applyVisibility called here from rebuildWindows
-        // (triggered by NSWorkspace.activeSpaceDidChangeNotification) would
-        // otherwise reset non-active banners back to alpha=1 mid-zoom-in,
-        // which is exactly the giant banner the user sees during zoom.
-        // Suppress here; the pending restore will fire applyVisibility again
-        // (with pendingVisibilityRestore == nil) once the transition is over.
+        // close transition. Visibility refreshes triggered by active Space
+        // changes would otherwise reset non-active banners back to alpha=1
+        // mid-zoom-in, which is exactly the giant banner the user sees during
+        // zoom. Suppress here; the pending restore will fire applyVisibility
+        // again once the transition is over.
         let inTransition = (pendingVisibilityRestore != nil) || isVisibilityTransitionSuppressed()
 
         for (spaceID, window) in windows {
@@ -1071,7 +1086,7 @@ private let cgsNotifyCallback: CGSNotifyProcPtr = { type, _, length, _ in
 
 // MARK: - Per-Space label window
 
-private final class MissionControlLabelWindow: NSWindow {
+private final class MissionControlLabelWindow: NSPanel {
     private var pinnedSpaceID: UInt64
 
     init(space: SpaceInfo) {
@@ -1083,7 +1098,7 @@ private final class MissionControlLabelWindow: NSWindow {
 
         super.init(
             contentRect: frame,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -1114,6 +1129,8 @@ private final class MissionControlLabelWindow: NSWindow {
         ignoresMouseEvents = true
         isExcludedFromWindowsMenu = true
         isReleasedWhenClosed = false
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = false
         alphaValue = 0
         // Stay at .normal so per-Space pinning enforced via
         // CGSAddWindowsToSpaces is honoured — any higher level (even +1)
@@ -1125,7 +1142,7 @@ private final class MissionControlLabelWindow: NSWindow {
         // enough of the label to read.
         level = .normal
         sharingType = .readWrite
-        collectionBehavior = []
+        collectionBehavior = [.ignoresCycle]
     }
 
     func update(space: SpaceInfo) {
@@ -1176,16 +1193,6 @@ private final class MissionControlLabelWindow: NSWindow {
         hosting.frame = NSRect(origin: .zero, size: frame.size)
         hosting.autoresizingMask = [.width, .height]
         contentView = hosting
-    }
-
-    /// Raises this banner above same-level user windows on its pinned
-    /// Space without changing NSWindow.level. The CGS reorder does NOT
-    /// switch Spaces.
-    func raiseInZOrder() {
-        guard windowNumber > 0 else { return }
-        let connection = CGSMainConnectionID()
-        // place=1 (kCGSOrderAbove), relative=0 → above the entire stack.
-        _ = CGSOrderWindow(connection, Int32(windowNumber), 1, 0)
     }
 
     private func pinToAssignedSpace(reason: String) {

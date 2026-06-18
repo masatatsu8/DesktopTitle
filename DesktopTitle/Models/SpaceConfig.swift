@@ -4,19 +4,16 @@
 //
 //  Per-Space user configuration (name + colors).
 //
-//  Storage model: a single flat dictionary keyed by the stable Space
-//  identity `"displayID:displayIndex"`. The display topology (which
-//  displays are connected at any moment) does NOT affect storage —
-//  names and colors persist regardless of which displays are plugged
-//  in. Earlier versions stored per-topology copies and silently lost
-//  data when the topology changed; the legacy data is migrated into
-//  the flat store on first load.
+//  Storage model: a single flat dictionary keyed by the stable Space UUID.
+//  Names and colors follow the desktop itself when Mission Control reorders
+//  Spaces. Earlier versions stored per-topology or display-position copies;
+//  legacy data is migrated into the flat store when matching Spaces are live.
 //
 
 import Foundation
 import SwiftUI
 
-/// Stable, display-positioned user data for a Space.
+/// Stable user data for a Space.
 private struct SpaceProfileData: Codable, Equatable {
     var name: String = ""
     var backgroundColor: CodableColor?
@@ -28,7 +25,8 @@ private struct SpaceProfileData: Codable, Equatable {
 }
 
 private struct SpaceConfigStore: Codable {
-    /// Authoritative store: stable key (`"displayID:displayIndex"`) → user data.
+    /// Authoritative store: stable key (`"spaceUUID:<uuid>"`) → user data.
+    /// Older builds used `"displayID:displayIndex"` keys; those are migrated.
     var spaceProfiles: [String: SpaceProfileData]?
 
     /// Legacy per-topology storage. Read for migration, never written.
@@ -109,7 +107,7 @@ struct SpaceConfig: Codable, Identifiable, Equatable {
 /// Manager for Space configurations.
 ///
 /// All per-Space user data lives in a single dictionary keyed by
-/// `"displayID:displayIndex"`. Topology / profile-mode parameters
+/// the Space UUID. Topology / profile-mode parameters
 /// passed via `setActiveProfile` are accepted for API compatibility
 /// but no longer affect what is stored or read.
 final class SpaceConfigManager: ObservableObject {
@@ -136,7 +134,7 @@ final class SpaceConfigManager: ObservableObject {
 
     /// Get or create config for a space.
     func getConfig(for spaceInfo: SpaceInfo) -> SpaceConfig {
-        let key = Self.stableKey(displayID: spaceInfo.displayID, displayIndex: spaceInfo.index)
+        let key = Self.stableKey(for: spaceInfo)
         let data = spaceProfiles[key]
         return SpaceConfig(
             id: spaceInfo.id,
@@ -150,14 +148,13 @@ final class SpaceConfigManager: ObservableObject {
 
     /// Update the name for a space.
     func setName(_ name: String, for spaceID: UInt64, displayIndex: Int, displayID: String? = nil) {
-        guard let resolvedDisplayID = resolveDisplayID(provided: displayID, spaceID: spaceID) else {
-            DebugLog.log("SpaceConfigManager", "setName ignored — displayID could not be resolved", details: [
+        guard let key = storageKey(spaceID: spaceID, displayIndex: displayIndex, displayID: displayID) else {
+            DebugLog.log("SpaceConfigManager", "setName ignored — storage key could not be resolved", details: [
                 "spaceID": "\(spaceID)",
                 "displayIndex": "\(displayIndex)"
             ])
             return
         }
-        let key = Self.stableKey(displayID: resolvedDisplayID, displayIndex: displayIndex)
         var data = spaceProfiles[key] ?? SpaceProfileData()
         data.name = name
         spaceProfiles[key] = data
@@ -167,14 +164,13 @@ final class SpaceConfigManager: ObservableObject {
 
     /// Update colors for a space.
     func setColors(backgroundColor: Color?, textColor: Color?, for spaceID: UInt64, displayIndex: Int, displayID: String? = nil) {
-        guard let resolvedDisplayID = resolveDisplayID(provided: displayID, spaceID: spaceID) else {
-            DebugLog.log("SpaceConfigManager", "setColors ignored — displayID could not be resolved", details: [
+        guard let key = storageKey(spaceID: spaceID, displayIndex: displayIndex, displayID: displayID) else {
+            DebugLog.log("SpaceConfigManager", "setColors ignored — storage key could not be resolved", details: [
                 "spaceID": "\(spaceID)",
                 "displayIndex": "\(displayIndex)"
             ])
             return
         }
-        let key = Self.stableKey(displayID: resolvedDisplayID, displayIndex: displayIndex)
         var data = spaceProfiles[key] ?? SpaceProfileData()
         data.backgroundColor = backgroundColor.map { CodableColor($0) }
         data.textColor = textColor.map { CodableColor($0) }
@@ -218,33 +214,51 @@ final class SpaceConfigManager: ObservableObject {
 
     // MARK: - Private
 
-    private static func stableKey(displayID: String, displayIndex: Int) -> String {
+    private static func stableKey(for spaceInfo: SpaceInfo) -> String {
+        "spaceUUID:\(spaceInfo.uuid)"
+    }
+
+    private static func fallbackSpaceIDKey(_ spaceID: UInt64) -> String {
+        "spaceID:\(spaceID)"
+    }
+
+    private static func displayPositionKey(displayID: String, displayIndex: Int) -> String {
         "\(displayID):\(displayIndex)"
     }
 
-    /// Resolve the displayID for a setter call. Callers usually pass it
-    /// explicitly, but the parameter has a `nil` default for API
-    /// compatibility — when that path is taken, fall back to the
-    /// SpaceConfig the caller already knows about (via `configs` or
-    /// the live SpaceIdentifier list) so the write does not silently
-    /// no-op when the caller forgets to thread the displayID through.
-    private func resolveDisplayID(provided: String?, spaceID: UInt64) -> String? {
-        if let provided { return provided }
-        if let existing = configs[spaceID]?.displayID { return existing }
+    private static func isSpaceIdentityKey(_ key: String) -> Bool {
+        key.hasPrefix("spaceUUID:") || key.hasPrefix("spaceID:")
+    }
+
+    private func storageKey(spaceID: UInt64, displayIndex: Int, displayID: String?) -> String? {
         if let live = SpaceIdentifier.shared.getAllSpaces().first(where: { $0.id == spaceID }) {
-            return live.displayID
+            return Self.stableKey(for: live)
         }
-        return nil
+        if configs[spaceID] != nil {
+            return Self.fallbackSpaceIDKey(spaceID)
+        }
+        guard displayID != nil || displayIndex > 0 else { return nil }
+        return Self.fallbackSpaceIDKey(spaceID)
     }
 
     private func refreshConfigs() {
         let currentSpaces = SpaceIdentifier.shared.getAllSpaces()
             .filter { !$0.isFullscreen }
+        if migrateDisplayPositionProfilesToSpaceIdentities(for: currentSpaces) {
+            persistConfigs()
+        }
+
         var newConfigs: [UInt64: SpaceConfig] = [:]
         for space in currentSpaces {
             newConfigs[space.id] = getConfig(for: space)
         }
+
+        guard newConfigs != configs else { return }
+
         configs = newConfigs
+        DebugLog.log("SpaceConfigManager", "configs refreshed", details: [
+            "count": "\(newConfigs.count)"
+        ])
     }
 
     private func persistConfigs() {
@@ -298,8 +312,8 @@ final class SpaceConfigManager: ObservableObject {
     /// a log entry if neither yields a result.
     private func migrateBareDictConfigs(_ legacy: [UInt64: SpaceConfig]) {
         let liveSpaces = SpaceIdentifier.shared.getAllSpaces().filter { !$0.isFullscreen }
-        let displayIDByLiveSpace: [UInt64: String] = Dictionary(
-            liveSpaces.map { ($0.id, $0.displayID) },
+        let liveSpaceByID: [UInt64: SpaceInfo] = Dictionary(
+            liveSpaces.map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
         let liveDisplayIDs = Set(liveSpaces.map(\.displayID))
@@ -317,9 +331,14 @@ final class SpaceConfigManager: ObservableObject {
             guard candidate.hasUserValues else { continue }
 
             let resolvedDisplayID = config.displayID
-                ?? displayIDByLiveSpace[spaceID]
+                ?? liveSpaceByID[spaceID]?.displayID
                 ?? singleDisplayFallback
-            if migrateSingleConfig(config, fallbackDisplayID: resolvedDisplayID, sourceKey: "bare-dict") {
+            if migrateSingleConfig(
+                config,
+                liveSpace: liveSpaceByID[spaceID],
+                fallbackDisplayID: resolvedDisplayID,
+                sourceKey: "bare-dict"
+            ) {
                 migrated += 1
             } else if resolvedDisplayID == nil {
                 skipped += 1
@@ -338,6 +357,11 @@ final class SpaceConfigManager: ObservableObject {
     }
 
     private func migrateLegacyTopologyConfigs(_ legacy: [String: [UInt64: SpaceConfig]]) {
+        let liveSpaceByID: [UInt64: SpaceInfo] = Dictionary(
+            SpaceIdentifier.shared.getAllSpaces().map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
         // Process single-display profiles BEFORE multi-display topologies, then
         // sort each group by key. A single-display profile's data is rooted in
         // the physical display, so when multiple legacy profiles claim the
@@ -360,7 +384,12 @@ final class SpaceConfigManager: ObservableObject {
             // Within a single profile, sort by spaceID to keep ordering stable.
             for spaceID in configs.keys.sorted() {
                 guard let config = configs[spaceID] else { continue }
-                if migrateSingleConfig(config, fallbackDisplayID: fallbackDisplayID, sourceKey: legacyKey) {
+                if migrateSingleConfig(
+                    config,
+                    liveSpace: liveSpaceByID[spaceID],
+                    fallbackDisplayID: fallbackDisplayID,
+                    sourceKey: legacyKey
+                ) {
                     migrated += 1
                 }
             }
@@ -377,10 +406,7 @@ final class SpaceConfigManager: ObservableObject {
     }
 
     @discardableResult
-    private func migrateSingleConfig(_ config: SpaceConfig, fallbackDisplayID: String?, sourceKey: String? = nil) -> Bool {
-        let displayID = config.displayID ?? fallbackDisplayID
-        guard let displayID else { return false }
-
+    private func migrateSingleConfig(_ config: SpaceConfig, liveSpace: SpaceInfo?, fallbackDisplayID: String?, sourceKey: String? = nil) -> Bool {
         let candidate = SpaceProfileData(
             name: config.name,
             backgroundColor: config.backgroundColor,
@@ -388,7 +414,15 @@ final class SpaceConfigManager: ObservableObject {
         )
         guard candidate.hasUserValues else { return false }
 
-        let key = Self.stableKey(displayID: displayID, displayIndex: config.displayIndex)
+        let key: String
+        if let liveSpace {
+            key = Self.stableKey(for: liveSpace)
+        } else if let displayID = config.displayID ?? fallbackDisplayID {
+            key = Self.displayPositionKey(displayID: displayID, displayIndex: config.displayIndex)
+        } else {
+            return false
+        }
+
         if let existing = spaceProfiles[key], existing.hasUserValues {
             DebugLog.log("SpaceConfigManager", "migration collision (kept first)", details: [
                 "key": key,
@@ -399,6 +433,43 @@ final class SpaceConfigManager: ObservableObject {
             return false
         }
         spaceProfiles[key] = candidate
+        return true
+    }
+
+    @discardableResult
+    private func migrateDisplayPositionProfilesToSpaceIdentities(for liveSpaces: [SpaceInfo]) -> Bool {
+        var migrated = 0
+        var collisions = 0
+
+        for space in liveSpaces {
+            let oldKey = Self.displayPositionKey(displayID: space.displayID, displayIndex: space.index)
+            guard !Self.isSpaceIdentityKey(oldKey),
+                  let data = spaceProfiles[oldKey],
+                  data.hasUserValues else {
+                continue
+            }
+
+            let newKey = Self.stableKey(for: space)
+            if let existing = spaceProfiles[newKey], existing.hasUserValues {
+                collisions += 1
+                DebugLog.log("SpaceConfigManager", "display-position migration collision (kept Space identity)", details: [
+                    "oldKey": oldKey,
+                    "newKey": newKey,
+                    "oldName": data.name,
+                    "keptName": existing.name
+                ])
+            } else {
+                spaceProfiles[newKey] = data
+                migrated += 1
+            }
+            spaceProfiles.removeValue(forKey: oldKey)
+        }
+
+        guard migrated > 0 || collisions > 0 else { return false }
+        DebugLog.log("SpaceConfigManager", "display-position profiles migrated to Space identity", details: [
+            "migrated": "\(migrated)",
+            "collisions": "\(collisions)"
+        ])
         return true
     }
 }

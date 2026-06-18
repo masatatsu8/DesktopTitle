@@ -12,7 +12,10 @@ import SwiftUI
 enum DebugLog {
     private static let queue = DispatchQueue(label: "DesktopTitle.DebugLog")
     private static let maxLogFileSizeBytes: UInt64 = 2 * 1024 * 1024
+    private static let logRetentionInterval: TimeInterval = 24 * 60 * 60
+    private static let pruneInterval: TimeInterval = 60 * 60
     private static let rotatedLogFileName = "debug.log.1"
+    private static var lastPruneAt: Date?
     private static let formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -42,7 +45,10 @@ enum DebugLog {
         #if DEBUG
         true
         #else
-        UserDefaults.standard.bool(forKey: "debugLoggingEnabled")
+        if let configured = UserDefaults.standard.object(forKey: "debugLoggingEnabled") as? Bool {
+            return configured
+        }
+        return true
         #endif
     }
 
@@ -51,6 +57,17 @@ enum DebugLog {
     }
 
     static func beginSession() {
+        if diskLoggingEnabled {
+            queue.async {
+                do {
+                    try pruneExpiredLogs(now: Date())
+                    lastPruneAt = Date()
+                } catch {
+                    print("[DebugLog] failed to prune expired logs: \(error)")
+                }
+            }
+        }
+
         log(
             "App",
             "debug session started",
@@ -90,6 +107,7 @@ enum DebugLog {
         queue.async {
             guard let data = "\(entry)\n".data(using: .utf8) else { return }
             do {
+                try pruneExpiredLogsIfNeeded(now: Date())
                 try rotateLogFileIfNeeded(incomingByteCount: UInt64(data.count))
                 let handle = try FileHandle(forWritingTo: logFileURL)
                 defer { try? handle.close() }
@@ -120,9 +138,72 @@ enum DebugLog {
         _ = fileManager.createFile(atPath: logFileURL.path, contents: nil)
     }
 
+    private static func pruneExpiredLogsIfNeeded(now: Date) throws {
+        if let lastPruneAt, now.timeIntervalSince(lastPruneAt) < pruneInterval {
+            return
+        }
+
+        try pruneExpiredLogs(now: now)
+        lastPruneAt = now
+    }
+
+    private static func pruneExpiredLogs(now: Date) throws {
+        let fileManager = FileManager.default
+        let cutoff = now.addingTimeInterval(-logRetentionInterval)
+
+        try pruneLogFile(at: logFileURL, cutoff: cutoff, removeIfEmpty: false)
+
+        guard fileManager.fileExists(atPath: rotatedLogFileURL.path) else { return }
+
+        let attributes = try fileManager.attributesOfItem(atPath: rotatedLogFileURL.path)
+        if let modifiedAt = attributes[.modificationDate] as? Date,
+           modifiedAt < cutoff {
+            try fileManager.removeItem(at: rotatedLogFileURL)
+            return
+        }
+
+        try pruneLogFile(at: rotatedLogFileURL, cutoff: cutoff, removeIfEmpty: true)
+    }
+
+    private static func pruneLogFile(at url: URL, cutoff: Date, removeIfEmpty: Bool) throws {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: url.path) else { return }
+
+        let contents = try String(contentsOf: url, encoding: .utf8)
+        guard !contents.isEmpty else {
+            if removeIfEmpty {
+                try fileManager.removeItem(at: url)
+            }
+            return
+        }
+
+        let keptLines = contents
+            .components(separatedBy: .newlines)
+            .filter { shouldKeepLogLine($0, cutoff: cutoff) }
+
+        if keptLines.isEmpty && removeIfEmpty {
+            try fileManager.removeItem(at: url)
+            return
+        }
+
+        let prunedContents = keptLines.isEmpty ? "" : keptLines.joined(separator: "\n") + "\n"
+        if prunedContents != contents {
+            try prunedContents.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private static func shouldKeepLogLine(_ line: String, cutoff: Date) -> Bool {
+        guard !line.isEmpty else { return false }
+        guard let timestampEnd = line.firstIndex(of: " ") else { return true }
+
+        let timestamp = String(line[..<timestampEnd])
+        guard let date = formatter.date(from: timestamp) else { return true }
+        return date >= cutoff
+    }
+
     static func describe(space: SpaceInfo?) -> String {
         guard let space else { return "nil" }
-        return "id=\(space.id),display=\(shortDisplayID(space.displayID)),index=\(space.index),fullscreen=\(space.isFullscreen)"
+        return "id=\(space.id),uuid=\(space.uuid),display=\(shortDisplayID(space.displayID)),index=\(space.index),fullscreen=\(space.isFullscreen)"
     }
 
     static func describe(spaces: [SpaceInfo]) -> String {
