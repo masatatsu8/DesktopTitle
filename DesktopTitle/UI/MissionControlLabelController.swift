@@ -89,6 +89,8 @@ final class MissionControlLabelController {
     private var pending1508s: [Date] = []
     private var pending1508EvalWork: DispatchWorkItem?
     private var pendingVisibilityRestore: DispatchWorkItem?
+    private let transitionSuppressionLock = NSLock()
+    private var transitionSuppressionUntil: Date = .distantPast
 
     /// Height (in points) of the MC thumbnail strip / target click region.
     /// A mouse-down inside this band while MC is active is treated as a
@@ -111,15 +113,27 @@ final class MissionControlLabelController {
     /// long lets a subsequent 1401 cancel the activation before any pixels
     /// hit the screen.
     private static let activationDelay: TimeInterval = 1.5
+    private static let visibilityTransitionSuppressionDuration: TimeInterval = 0.35
+    private static let desktopOverlayTransitionDelay: TimeInterval = 0.75
 
     static weak var shared: MissionControlLabelController?
 
     private let settings = AppSettings.shared
     private let spaceIdentifier = SpaceIdentifier.shared
 
+    func desktopOverlayDelayOverrideForSpaceChange(defaultDelay: TimeInterval) -> TimeInterval? {
+        let shouldDelay = isMissionControlActive
+            || pendingActivationWork != nil
+            || pending1508EvalWork != nil
+            || isVisibilityTransitionSuppressed()
+
+        guard shouldDelay else { return nil }
+        return max(defaultDelay, Self.desktopOverlayTransitionDelay)
+    }
+
     func start() {
         Self.shared = self
-        rebuildWindows()
+        rebuildWindows(reason: "start")
 
         workspaceObservers.append(
             NSWorkspace.shared.notificationCenter.addObserver(
@@ -127,7 +141,7 @@ final class MissionControlLabelController {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.rebuildWindows()
+                self?.syncWindowsAfterActiveSpaceChange()
             }
         )
 
@@ -240,13 +254,18 @@ final class MissionControlLabelController {
             // tapDisabledBy* event. Periodically check tap state and re-
             // enable when needed. The timer is scheduled on this thread's
             // run loop, so it runs alongside the tap callback.
+            var lastHealthCheckLogAt = Date.distantPast
             let healthTimer = Timer(
                 timeInterval: 0.5,
                 repeats: true
             ) { _ in
                 if !CGEvent.tapIsEnabled(tap: tap) {
                     CGEvent.tapEnable(tap: tap, enable: true)
-                    DebugLog.log("MissionControlLabel", "CGEventTap re-enabled (health-check)")
+                    let now = Date()
+                    if now.timeIntervalSince(lastHealthCheckLogAt) >= 60 {
+                        lastHealthCheckLogAt = now
+                        DebugLog.log("MissionControlLabel", "CGEventTap re-enabled (health-check)")
+                    }
                 }
             }
             RunLoop.current.add(healthTimer, forMode: .common)
@@ -374,6 +393,16 @@ final class MissionControlLabelController {
         }
     }
 
+    fileprivate func prepareForCGSTransitionEvent(type: UInt32) {
+        guard type == 1401 || type == 1508 else { return }
+        guard isMissionControlActive else { return }
+        extendVisibilityTransitionSuppression(
+            for: Self.visibilityTransitionSuppressionDuration,
+            reason: "cgs-\(type)"
+        )
+        hideAllBannersViaCGS()
+    }
+
     /// Called from the CGEventTap dedicated background thread. We use the
     /// thread-safe CGSSetWindowAlpha private API to drop every banner's
     /// alpha to 0 the instant a left mouse-down is observed — without ever
@@ -395,8 +424,8 @@ final class MissionControlLabelController {
             for window in self.windows.values {
                 window.alphaValue = 0
             }
-            // Long fallback so pendingVisibilityRestore is non-nil for the
-            // entire click → zoom → close window. applyVisibility uses this
+            // Long fallback so pendingVisibilityRestore is non-nil until
+            // mouseUp / 1401 / close replaces it. applyVisibility uses this
             // to suppress alpha=1 restores from rebuildWindows triggered by
             // NSWorkspace.activeSpaceDidChange while zoom-in is on screen.
             self.scheduleVisibilityRestore(after: 5.0, reason: "eventTap-mouseDown fallback")
@@ -503,6 +532,9 @@ final class MissionControlLabelController {
         case 1507:
             // Some older macOS versions emit 1507 on MC close. Keep it as a
             // belt-and-braces deactivation path.
+            cancelPendingActivation(reason: "1507")
+            cancelPendingVisibilityRestore(reason: "1507")
+            clearVisibilityTransitionSuppression(reason: "1507")
             if isMissionControlActive {
                 deactivateMissionControl(reason: "1507")
             }
@@ -593,6 +625,7 @@ final class MissionControlLabelController {
 
     private func scheduleVisibilityRestore(after delay: TimeInterval, reason: String) {
         pendingVisibilityRestore?.cancel()
+        replaceVisibilityTransitionSuppression(for: delay, reason: reason)
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingVisibilityRestore = nil
@@ -612,11 +645,64 @@ final class MissionControlLabelController {
         ])
     }
 
+    private func replaceVisibilityTransitionSuppression(for delay: TimeInterval, reason: String) {
+        let until = Date().addingTimeInterval(delay)
+        transitionSuppressionLock.lock()
+        transitionSuppressionUntil = until
+        transitionSuppressionLock.unlock()
+        DebugLog.log("MissionControlLabel", "replaced visibility transition suppression", details: [
+            "reason": reason,
+            "delayMs": "\(Int(delay * 1000))"
+        ])
+    }
+
+    private func extendVisibilityTransitionSuppression(for delay: TimeInterval, reason: String) {
+        let until = Date().addingTimeInterval(delay)
+        transitionSuppressionLock.lock()
+        if until > transitionSuppressionUntil {
+            transitionSuppressionUntil = until
+        }
+        transitionSuppressionLock.unlock()
+        DebugLog.log("MissionControlLabel", "extended visibility transition suppression", details: [
+            "reason": reason,
+            "delayMs": "\(Int(delay * 1000))"
+        ])
+    }
+
+    private func isVisibilityTransitionSuppressed(now: Date = Date()) -> Bool {
+        transitionSuppressionLock.lock()
+        let until = transitionSuppressionUntil
+        transitionSuppressionLock.unlock()
+        return now < until
+    }
+
+    private func clearVisibilityTransitionSuppression(reason: String) {
+        transitionSuppressionLock.lock()
+        transitionSuppressionUntil = .distantPast
+        transitionSuppressionLock.unlock()
+        DebugLog.log("MissionControlLabel", "cleared visibility transition suppression", details: [
+            "reason": reason
+        ])
+    }
+
     private func scheduleDelayedActivation(reason: String) {
         cancelPendingActivation(reason: "rescheduled")
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingActivationWork = nil
+            let visibleDisplayIDs = self.missionControlVisibleDisplayIDsInWindowList()
+            guard !visibleDisplayIDs.isEmpty else {
+                self.hideAllBannersImmediately(reason: "activation skipped; no Mission Control window")
+                DebugLog.log("MissionControlLabel", "skipped delayed activation", details: [
+                    "reason": reason,
+                    "validation": "no Mission Control Dock window"
+                ])
+                return
+            }
+            DebugLog.log("MissionControlLabel", "validated delayed activation", details: [
+                "reason": reason,
+                "missionControlDisplays": visibleDisplayIDs.sorted().joined(separator: ",")
+            ])
             self.activateMissionControl(reason: "\(reason) (after \(Int(Self.activationDelay * 1000))ms)")
         }
         pendingActivationWork = work
@@ -625,6 +711,73 @@ final class MissionControlLabelController {
             "delayMs": "\(Int(Self.activationDelay * 1000))"
         ])
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.activationDelay, execute: work)
+    }
+
+    private func missionControlVisibleDisplayIDsInWindowList() -> Set<String> {
+        guard let windowList = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+
+        let screenFrames = quartzScreenFramesByDisplayID()
+        guard !screenFrames.isEmpty else { return [] }
+
+        var displayIDs = Set<String>()
+        for windowInfo in windowList {
+            guard windowInfo[kCGWindowOwnerName as String] as? String == "Dock" else {
+                continue
+            }
+
+            if let name = windowInfo[kCGWindowName as String] as? String,
+               name.hasPrefix("Wallpaper-") {
+                continue
+            }
+
+            let layer = (windowInfo[kCGWindowLayer as String] as? NSNumber)?.intValue ?? Int.min
+            guard layer >= 0 else { continue }
+
+            guard let frame = windowFrame(from: windowInfo) else {
+                continue
+            }
+
+            for (displayID, screenFrame) in screenFrames {
+                guard frame.intersection(screenFrame).isNull == false else { continue }
+                let overlap = frame.intersection(screenFrame)
+                let overlapArea = overlap.width * overlap.height
+                let screenArea = screenFrame.width * screenFrame.height
+                if screenArea > 0, overlapArea >= screenArea * 0.6 {
+                    displayIDs.insert(displayID)
+                }
+            }
+        }
+
+        return displayIDs
+    }
+
+    private func quartzScreenFramesByDisplayID() -> [String: CGRect] {
+        guard let mainFrame = NSScreen.main?.frame else { return [:] }
+        var frames: [String: CGRect] = [:]
+        for screen in NSScreen.screens {
+            guard let displayID = screen.displayUUIDString else { continue }
+            let frame = screen.frame
+            frames[displayID] = CGRect(
+                x: frame.minX,
+                y: mainFrame.maxY - frame.maxY,
+                width: frame.width,
+                height: frame.height
+            )
+        }
+        return frames
+    }
+
+    private func windowFrame(from windowInfo: [String: Any]) -> CGRect? {
+        guard let bounds = windowInfo[kCGWindowBounds as String] as? [String: Any],
+              let x = (bounds["X"] as? NSNumber)?.doubleValue,
+              let y = (bounds["Y"] as? NSNumber)?.doubleValue,
+              let width = (bounds["Width"] as? NSNumber)?.doubleValue,
+              let height = (bounds["Height"] as? NSNumber)?.doubleValue else {
+            return nil
+        }
+        return CGRect(x: x, y: y, width: width, height: height)
     }
 
     private func cancelPendingActivation(reason: String) {
@@ -639,26 +792,16 @@ final class MissionControlLabelController {
     private func activateMissionControl(reason: String) {
         rearmSafetyTimer()
         if !isMissionControlActive {
+            clearVisibilityTransitionSuppression(reason: "activate")
             isMissionControlActive = true
             applyVisibility(reason: "mc activate (\(reason))")
-            // Raise non-active banners above same-level user windows so
-            // they aren't occluded inside their MC thumbnails. Doing this
-            // here (once on activation) and lowering them on deactivation
-            // keeps the z-state clean — repeating the raise on every
-            // applyVisibility caused MC bounce-back / multi-skip in
-            // earlier iterations. Skip every display's active Space (not
-            // just the primary's) so external displays' active Spaces are
-            // also left alone.
-            let activePerDisplay = Set(spaceIdentifier.getCurrentSpacesByDisplay().values.map(\.id))
-            for (spaceID, window) in windows where !activePerDisplay.contains(spaceID) {
-                window.raiseInZOrder()
-            }
         }
     }
 
     private func deactivateMissionControl(reason: String) {
         cancelPendingActivation(reason: "deactivate")
         cancelPendingVisibilityRestore(reason: "deactivate")
+        clearVisibilityTransitionSuppression(reason: "deactivate")
         mcDeactivationTimer?.invalidate()
         mcDeactivationTimer = nil
         if isMissionControlActive {
@@ -726,19 +869,40 @@ final class MissionControlLabelController {
     }
 
     func refreshLabels() {
-        rebuildWindows()
+        rebuildWindows(reason: "refreshLabels")
     }
 
     // MARK: - Window lifecycle
 
-    private func rebuildWindows() {
+    private func syncWindowsAfterActiveSpaceChange() {
         guard settings.showMissionControlLabels else {
             tearDownAllWindows(reason: "settingDisabled")
             return
         }
 
-        let spaces = spaceIdentifier.getAllSpaces()
-            .filter { settings.showForFullscreen || !$0.isFullscreen }
+        let spaces = eligibleLabelSpaces()
+        let liveSpaceIDs = Set(spaces.map { $0.id })
+        let existingSpaceIDs = Set(windows.keys)
+
+        guard liveSpaceIDs == existingSpaceIDs else {
+            rebuildWindows(reason: "activeSpaceChanged-topologyChanged")
+            return
+        }
+
+        applyVisibility(reason: "activeSpaceChanged")
+        DebugLog.log("MissionControlLabel", "active Space changed without rebuilding label windows", details: [
+            "windowCount": "\(windows.count)",
+            "spaceIDs": liveSpaceIDs.sorted().map(String.init).joined(separator: ",")
+        ])
+    }
+
+    private func rebuildWindows(reason: String) {
+        guard settings.showMissionControlLabels else {
+            tearDownAllWindows(reason: "settingDisabled")
+            return
+        }
+
+        let spaces = eligibleLabelSpaces()
 
         let liveSpaceIDs = Set(spaces.map { $0.id })
 
@@ -760,12 +924,18 @@ final class MissionControlLabelController {
         }
 
         refreshBannerWindowIDsCache()
-        applyVisibility(reason: "rebuildWindows")
+        applyVisibility(reason: "rebuildWindows (\(reason))")
 
         DebugLog.log("MissionControlLabel", "rebuilt windows", details: [
+            "reason": reason,
             "windowCount": "\(windows.count)",
             "spaces": DebugLog.describe(spaces: spaces)
         ])
+    }
+
+    private func eligibleLabelSpaces() -> [SpaceInfo] {
+        spaceIdentifier.getAllSpaces()
+            .filter { settings.showForFullscreen || !$0.isFullscreen }
     }
 
     private func tearDownAllWindows(reason: String) {
@@ -802,16 +972,18 @@ final class MissionControlLabelController {
         // target=1 and the giant banner would show on it during MC. Use the
         // per-display map instead so every display's active Space is treated
         // as the local "do not show banner" Space.
+        let spaces = spaceIdentifier.getAllSpaces()
+        let displayIDBySpaceID = Dictionary(uniqueKeysWithValues: spaces.map { ($0.id, $0.displayID) })
         let activePerDisplay = Set(spaceIdentifier.getCurrentSpacesByDisplay().values.map(\.id))
+        let missionControlDisplayIDs = isMissionControlActive ? missionControlVisibleDisplayIDsInWindowList() : []
         let showOnActive = settings.showMissionControlLabelOnActiveSpace
         // While a visibility restore is pending we are in a click → zoom →
-        // close transition. applyVisibility called here from rebuildWindows
-        // (triggered by NSWorkspace.activeSpaceDidChangeNotification) would
-        // otherwise reset non-active banners back to alpha=1 mid-zoom-in,
-        // which is exactly the giant banner the user sees during zoom.
-        // Suppress here; the pending restore will fire applyVisibility again
-        // (with pendingVisibilityRestore == nil) once the transition is over.
-        let inTransition = (pendingVisibilityRestore != nil)
+        // close transition. Visibility refreshes triggered by active Space
+        // changes would otherwise reset non-active banners back to alpha=1
+        // mid-zoom-in, which is exactly the giant banner the user sees during
+        // zoom. Suppress here; the pending restore will fire applyVisibility
+        // again once the transition is over.
+        let inTransition = (pendingVisibilityRestore != nil) || isVisibilityTransitionSuppressed()
 
         for (spaceID, window) in windows {
             let target: CGFloat
@@ -820,6 +992,9 @@ final class MissionControlLabelController {
             } else if !isMissionControlActive {
                 target = 0
             } else if inTransition {
+                target = 0
+            } else if let displayID = displayIDBySpaceID[spaceID],
+                      !missionControlDisplayIDs.contains(displayID) {
                 target = 0
             } else if activePerDisplay.contains(spaceID) {
                 target = showOnActive ? 1 : 0
@@ -834,6 +1009,7 @@ final class MissionControlLabelController {
             "isMissionControlActive": "\(isMissionControlActive)",
             "inTransition": "\(inTransition)",
             "activePerDisplay": activePerDisplay.sorted().map(String.init).joined(separator: ","),
+            "missionControlDisplays": missionControlDisplayIDs.sorted().joined(separator: ","),
             "showOnActive": "\(showOnActive)",
             "windowCount": "\(windows.count)"
         ])
@@ -892,7 +1068,7 @@ private let cgsNotifyCallback: CGSNotifyProcPtr = { type, _, length, _ in
     // animation capture alpha=1 banners — by the time the main handler
     // gets to run, the WindowServer already shows alpha=0.
     if type == 1401 || type == 1508 {
-        MissionControlLabelController.shared?.hideAllBannersViaCGSIfMCActive()
+        MissionControlLabelController.shared?.prepareForCGSTransitionEvent(type: type)
         // Force-enable the CGEventTap on every MC-related CGS event. macOS
         // Tahoe silently disables listenOnly taps during idle, and our
         // 500 ms health-check timer can miss the very first click after
@@ -910,7 +1086,7 @@ private let cgsNotifyCallback: CGSNotifyProcPtr = { type, _, length, _ in
 
 // MARK: - Per-Space label window
 
-private final class MissionControlLabelWindow: NSWindow {
+private final class MissionControlLabelWindow: NSPanel {
     private var pinnedSpaceID: UInt64
 
     init(space: SpaceInfo) {
@@ -922,7 +1098,7 @@ private final class MissionControlLabelWindow: NSWindow {
 
         super.init(
             contentRect: frame,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -935,7 +1111,7 @@ private final class MissionControlLabelWindow: NSWindow {
         // switch. After this, pinToAssignedSpace moves it to the target Space.
         // Subsequent updates MUST NOT orderFront — see update(space:).
         orderFrontRegardless()
-        pinToAssignedSpace()
+        pinToAssignedSpace(reason: "initial")
     }
 
     override var canBecomeKey: Bool { false }
@@ -953,6 +1129,8 @@ private final class MissionControlLabelWindow: NSWindow {
         ignoresMouseEvents = true
         isExcludedFromWindowsMenu = true
         isReleasedWhenClosed = false
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = false
         alphaValue = 0
         // Stay at .normal so per-Space pinning enforced via
         // CGSAddWindowsToSpaces is honoured — any higher level (even +1)
@@ -964,10 +1142,11 @@ private final class MissionControlLabelWindow: NSWindow {
         // enough of the label to read.
         level = .normal
         sharingType = .readWrite
-        collectionBehavior = []
+        collectionBehavior = [.ignoresCycle]
     }
 
     func update(space: SpaceInfo) {
+        let previousPinnedSpaceID = pinnedSpaceID
         pinnedSpaceID = space.id
 
         if let screen = NSScreen.screens.first(where: { $0.displayUUIDString == space.displayID }) ?? NSScreen.main {
@@ -975,9 +1154,11 @@ private final class MissionControlLabelWindow: NSWindow {
         }
 
         installContent(for: space)
-        // pinToAssignedSpace is idempotent and does NOT order the window front,
-        // so it is safe to call from update without forcing a Space switch.
-        pinToAssignedSpace()
+        // Routine content/frame refreshes must not mutate CGS Space membership:
+        // even "idempotent" CGS add/remove bursts can drag the active Space.
+        if previousPinnedSpaceID != space.id {
+            pinToAssignedSpace(reason: "spaceIDChanged")
+        }
 
         DebugLog.log("MissionControlLabel", "updated label window", details: [
             "space": DebugLog.describe(space: space),
@@ -1014,17 +1195,7 @@ private final class MissionControlLabelWindow: NSWindow {
         contentView = hosting
     }
 
-    /// Raises this banner above same-level user windows on its pinned
-    /// Space without changing NSWindow.level. The CGS reorder does NOT
-    /// switch Spaces.
-    func raiseInZOrder() {
-        guard windowNumber > 0 else { return }
-        let connection = CGSMainConnectionID()
-        // place=1 (kCGSOrderAbove), relative=0 → above the entire stack.
-        _ = CGSOrderWindow(connection, Int32(windowNumber), 1, 0)
-    }
-
-    private func pinToAssignedSpace() {
+    private func pinToAssignedSpace(reason: String) {
         guard windowNumber > 0 else { return }
 
         let connection = CGSMainConnectionID()
@@ -1056,6 +1227,12 @@ private final class MissionControlLabelWindow: NSWindow {
                 )
             }
         }
+
+        DebugLog.log("MissionControlLabel", "pinned label window to space", details: [
+            "reason": reason,
+            "spaceID": "\(pinnedSpaceID)",
+            "window": DebugLog.describe(window: self)
+        ])
     }
 
     private func unpinFromSpaces() {

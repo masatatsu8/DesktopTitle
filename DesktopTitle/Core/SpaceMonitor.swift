@@ -313,6 +313,10 @@ final class SpaceMonitor: ObservableObject {
         let previousSpaces = currentSpacesByDisplay
         currentSpacesByDisplay = newSpaces
 
+        let previousDisplayIDs = Set(previousSpaces.keys)
+        let newDisplayIDs = Set(newSpaces.keys)
+        let displayTopologyChanged = previousDisplayIDs != newDisplayIDs
+
         let changedSpaces = orderedSpaces(
             newSpaces.values.filter { previousSpaces[$0.displayID]?.id != $0.id }
         )
@@ -338,11 +342,26 @@ final class SpaceMonitor: ObservableObject {
                 "previousSpaces": DebugLog.describe(spacesByDisplay: previousSpaces),
                 "newSpaces": DebugLog.describe(spacesByDisplay: newSpaces),
                 "changedSpaces": DebugLog.describe(spaces: changedSpaces),
-                "currentSpace": DebugLog.describe(space: currentSpace)
+                "currentSpace": DebugLog.describe(space: currentSpace),
+                "displayTopologyChanged": "\(displayTopologyChanged)"
             ]
         )
 
         guard let trigger, !changedSpaces.isEmpty else { return }
+
+        guard !displayTopologyChanged else {
+            DebugLog.log(
+                "SpaceMonitor",
+                "space change event suppressed because display topology changed",
+                details: [
+                    "trigger": trigger,
+                    "previousDisplays": previousDisplayIDs.sorted().map(DebugLog.shortDisplayID).joined(separator: ","),
+                    "newDisplays": newDisplayIDs.sorted().map(DebugLog.shortDisplayID).joined(separator: ","),
+                    "changedSpaces": DebugLog.describe(spaces: changedSpaces)
+                ]
+            )
+            return
+        }
 
         let event = SpaceChangeEvent(
             changedSpaces: changedSpaces,
