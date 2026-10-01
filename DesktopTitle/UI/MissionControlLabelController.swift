@@ -513,11 +513,11 @@ final class MissionControlLabelController {
             // ever desyncs (e.g., MC closing while DesktopTitle was paused).
             let now = Date()
             pending1508s.append(now)
-            // If a 1401 fired within the last 50 ms, this 1508 is part of a
-            // click-thumbnail close pulse. Hide banners synchronously now
-            // so they don't show during the destination Space's zoom-in.
-            if isMissionControlActive && now.timeIntervalSince(lastSpaceChangeAt) < 0.05 {
-                hideAllBannersImmediately(reason: "1508-with-recent-1401")
+            // The callback already hid the WindowServer windows via CGS.
+            // Keep AppKit's alpha in sync so restoring to 1 is not treated
+            // as an unchanged value while the server still has alpha 0.
+            if isMissionControlActive {
+                hideAllBannersImmediately(reason: "1508-sync-CGS-hide")
             }
             if pending1508EvalWork == nil {
                 let work = DispatchWorkItem { [weak self] in
@@ -603,7 +603,15 @@ final class MissionControlLabelController {
             // banners early via hideAllBannersImmediately if a 1401 was
             // recent, so re-apply visibility to restore them.
             DebugLog.log("MissionControlLabel", "1508 single while active → restore", details: [:])
-            applyVisibility(reason: "1508-single restore")
+            // The CGS callback suppresses visibility for 350 ms. Restoring
+            // here after only 30 ms leaves every banner hidden indefinitely.
+            // Preserve any mouse-down restore so a held click stays hidden.
+            if pendingVisibilityRestore == nil {
+                scheduleVisibilityRestore(
+                    after: Self.visibilityTransitionSuppressionDuration,
+                    reason: "1508-single restore"
+                )
+            }
         } else {
             scheduleDelayedActivation(reason: "1508-open")
         }
@@ -630,6 +638,15 @@ final class MissionControlLabelController {
             guard let self else { return }
             self.pendingVisibilityRestore = nil
             guard self.isMissionControlActive else { return }
+            // A later CGS event can extend suppression beyond this timer.
+            // Re-arm instead of consuming the only restore while hidden.
+            self.transitionSuppressionLock.lock()
+            let remaining = self.transitionSuppressionUntil.timeIntervalSinceNow
+            self.transitionSuppressionLock.unlock()
+            if remaining > 0 {
+                self.scheduleVisibilityRestore(after: remaining, reason: reason)
+                return
+            }
             self.applyVisibility(reason: reason)
         }
         pendingVisibilityRestore = work
@@ -686,7 +703,8 @@ final class MissionControlLabelController {
     }
 
     private func scheduleDelayedActivation(reason: String) {
-        cancelPendingActivation(reason: "rescheduled")
+        // Repeated open notifications must not keep postponing activation.
+        guard pendingActivationWork == nil else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingActivationWork = nil
@@ -754,17 +772,13 @@ final class MissionControlLabelController {
     }
 
     private func quartzScreenFramesByDisplayID() -> [String: CGRect] {
-        guard let mainFrame = NSScreen.main?.frame else { return [:] }
         var frames: [String: CGRect] = [:]
         for screen in NSScreen.screens {
-            guard let displayID = screen.displayUUIDString else { continue }
-            let frame = screen.frame
-            frames[displayID] = CGRect(
-                x: frame.minX,
-                y: mainFrame.maxY - frame.maxY,
-                width: frame.width,
-                height: frame.height
-            )
+            guard let displayID = screen.displayUUIDString,
+                  let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { continue }
+            // NSScreen.main follows keyboard focus, so it is not a stable
+            // origin for converting AppKit coordinates on multiple displays.
+            frames[displayID] = CGDisplayBounds(screenNumber)
         }
         return frames
     }
