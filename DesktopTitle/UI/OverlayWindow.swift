@@ -9,7 +9,7 @@ import AppKit
 import SwiftUI
 
 /// A borderless, transparent window that displays above all other windows
-final class OverlayWindow: NSWindow, NSWindowDelegate {
+final class OverlayWindow: NSPanel, NSWindowDelegate {
     private let displayID: String
 
     init(displayID: String) {
@@ -20,7 +20,7 @@ final class OverlayWindow: NSWindow, NSWindowDelegate {
 
         super.init(
             contentRect: screenRect,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -40,6 +40,8 @@ final class OverlayWindow: NSWindow, NSWindowDelegate {
         // on the current space each time, then destroyed after animation.
         level = .screenSaver
         collectionBehavior = [.ignoresCycle, .fullScreenAuxiliary]
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = false
 
         // Ignore mouse events (click-through)
         ignoresMouseEvents = true

@@ -16,6 +16,7 @@ private struct ManagedDisplaySpace {
 /// Represents information about a single Space
 struct SpaceInfo: Identifiable, Equatable {
     let id: UInt64          // CGSSpaceID
+    let uuid: String        // Stable Space UUID from Mission Control
     let displayID: String   // Display UUID
     let index: Int          // 1-based index within the display
     let isFullscreen: Bool  // Whether this is a fullscreen space
@@ -44,6 +45,17 @@ final class SpaceIdentifier {
             return UInt64(v)
         case let v as NSNumber:
             return v.uint64Value
+        default:
+            return nil
+        }
+    }
+
+    private func extractString(from value: Any?) -> String? {
+        switch value {
+        case let v as String:
+            return v
+        case let v as NSNumber:
+            return v.stringValue
         default:
             return nil
         }
@@ -218,6 +230,7 @@ final class SpaceIdentifier {
 
         return SpaceInfo(
             id: finalSpaceID,
+            uuid: extractString(from: spaceDict["uuid"]) ?? "\(finalSpaceID)",
             displayID: displayID,
             index: index,
             isFullscreen: isFullscreen
